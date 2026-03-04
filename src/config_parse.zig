@@ -1200,6 +1200,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (lc.get("purge_after_days")) |v| if (v == .integer) {
                         self.memory.lifecycle.purge_after_days = @intCast(v.integer);
                     };
+                    if (lc.get("preserve_before_purge")) |v| if (v == .bool) {
+                        self.memory.lifecycle.preserve_before_purge = v.bool;
+                    };
                     if (lc.get("conversation_retention_days")) |v| if (v == .integer) {
                         self.memory.lifecycle.conversation_retention_days = @intCast(v.integer);
                     };

@@ -114,6 +114,7 @@
       "hygiene_enabled": true,
       "archive_after_days": 7,
       "purge_after_days": 30,
+      "preserve_before_purge": true,
       "conversation_retention_days": 30,
       "snapshot_enabled": false,
       "snapshot_on_hygiene": false,

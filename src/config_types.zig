@@ -906,6 +906,7 @@ pub const MemoryLifecycleConfig = struct {
     hygiene_enabled: bool = true,
     archive_after_days: u32 = 7,
     purge_after_days: u32 = 30,
+    preserve_before_purge: bool = true,
     conversation_retention_days: u32 = 30,
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
