@@ -2752,10 +2752,43 @@ test "Agent clearHistory then add messages" {
 // ── Slash Command Tests ──────────────────────────────────────────
 
 fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator_.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator_.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy-test-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const dummy_vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supportsNativeTools,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+
     var noop = observability.NoopObserver{};
     return Agent{
         .allocator = allocator,
-        .provider = undefined,
+        .provider = .{ .ptr = @ptrFromInt(1), .vtable = &dummy_vtable },
         .tools = &.{},
         .tool_specs = try allocator.alloc(ToolSpec, 0),
         .mem = null,
