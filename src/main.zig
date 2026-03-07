@@ -102,6 +102,10 @@ pub fn main() !void {
         try yc.provider_probe.run(allocator, args[2..]);
         return;
     }
+    if (std.mem.eql(u8, args[1], "--probe-channel-health")) {
+        try yc.channel_probe.run(allocator, args[2..]);
+        return;
+    }
     if (std.mem.eql(u8, args[1], "--from-json")) {
         try yc.from_json.run(allocator, args[2..]);
         return;
@@ -1737,7 +1741,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .autonomy = config.autonomy.level,
         .workspace_dir = config.workspace_dir,
         .workspace_only = config.autonomy.workspace_only,
-        .allowed_commands = if (config.autonomy.allowed_commands.len > 0) config.autonomy.allowed_commands else &security.default_allowed_commands,
+        .allowed_commands = security.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
         .max_actions_per_hour = config.autonomy.max_actions_per_hour,
         .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
         .block_high_risk_commands = config.autonomy.block_high_risk_commands,
@@ -2058,7 +2062,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .autonomy = config.autonomy.level,
         .workspace_dir = config.workspace_dir,
         .workspace_only = config.autonomy.workspace_only,
-        .allowed_commands = if (config.autonomy.allowed_commands.len > 0) config.autonomy.allowed_commands else &security.default_allowed_commands,
+        .allowed_commands = security.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
         .max_actions_per_hour = config.autonomy.max_actions_per_hour,
         .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
         .block_high_risk_commands = config.autonomy.block_high_risk_commands,

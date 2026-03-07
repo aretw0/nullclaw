@@ -59,6 +59,21 @@ pub const default_allowed_commands = [_][]const u8{
     "git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail",
 };
 
+pub const full_autonomy_default_allowed_commands = [_][]const u8{"*"};
+
+/// Resolve command allowlist defaults from autonomy level and configured list.
+/// - explicit config always wins
+/// - full autonomy + empty list => wildcard
+/// - other modes + empty list => conservative default list
+pub fn resolveAllowedCommands(
+    autonomy: AutonomyLevel,
+    configured: []const []const u8,
+) []const []const u8 {
+    if (configured.len > 0) return configured;
+    if (autonomy == .full) return &full_autonomy_default_allowed_commands;
+    return &default_allowed_commands;
+}
+
 /// Security policy enforced on all tool executions
 pub const SecurityPolicy = struct {
     autonomy: AutonomyLevel = .supervised,
@@ -193,8 +208,8 @@ pub const SecurityPolicy = struct {
         // bare & in URLs like https://...?a=1&b=2 is permitted.
         if (!self.allow_raw_url_chars and containsSingleAmpersand(command)) return false;
 
-        // Block output redirections
-        if (std.mem.indexOfScalar(u8, command, '>') != null) return false;
+        // Block output redirections except null-sink redirects (`/dev/null` / `NUL`).
+        if (containsUnsafeRedirection(command)) return false;
 
         var normalized: [MAX_ANALYSIS_LEN]u8 = undefined;
         const norm_len = normalizeCommand(command, &normalized);
@@ -340,6 +355,104 @@ fn containsSingleAmpersand(s: []const u8) bool {
         const prev_is_amp = i > 0 and s[i - 1] == '&';
         const next_is_amp = i + 1 < s.len and s[i + 1] == '&';
         if (!prev_is_amp and !next_is_amp) return true;
+    }
+    return false;
+}
+
+/// Detect unsafe output redirections.
+/// Allows redirects to null sinks only:
+/// - `/dev/null` (POSIX)
+/// - `NUL` (Windows device path)
+/// Quote-aware: ignores `>` inside quoted strings.
+fn containsUnsafeRedirection(s: []const u8) bool {
+    if (s.len == 0) return false;
+
+    var in_single_quote = false;
+    var in_double_quote = false;
+    var escaped = false;
+
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const b = s[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        if (b == '\\' and !in_single_quote) {
+            escaped = true;
+            continue;
+        }
+
+        if (b == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if (b == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+
+        if (in_single_quote or in_double_quote) continue;
+        if (b != '>') continue;
+
+        // Skip optional `>` for append redirection (`>>`).
+        var target_start = i + 1;
+        if (target_start < s.len and s[target_start] == '>') {
+            target_start += 1;
+        }
+
+        while (target_start < s.len and (s[target_start] == ' ' or s[target_start] == '\t')) : (target_start += 1) {}
+        if (target_start >= s.len) return true;
+
+        // File descriptor duplication (e.g. `2>&1`) is not allowed.
+        if (s[target_start] == '&') return true;
+
+        // Parse redirect target token, honoring quotes.
+        var target_end = target_start;
+        var target_in_single = false;
+        var target_in_double = false;
+        var target_escaped = false;
+        while (target_end < s.len) : (target_end += 1) {
+            const tb = s[target_end];
+            if (target_escaped) {
+                target_escaped = false;
+                continue;
+            }
+            if (tb == '\\' and !target_in_single) {
+                target_escaped = true;
+                continue;
+            }
+            if (tb == '\'' and !target_in_double) {
+                target_in_single = !target_in_single;
+                continue;
+            }
+            if (tb == '"' and !target_in_single) {
+                target_in_double = !target_in_double;
+                continue;
+            }
+
+            if (!target_in_single and !target_in_double and
+                (tb == ' ' or tb == '\t' or tb == '\n' or tb == ';' or tb == '|' or tb == '&'))
+            {
+                break;
+            }
+        }
+
+        const target = trimMatchingQuotes(std.mem.trim(u8, s[target_start..target_end], " \t"));
+        if (!isNullSinkTarget(target)) return true;
+
+        if (target_end == 0) continue;
+        i = target_end - 1;
+    }
+
+    return false;
+}
+
+fn isNullSinkTarget(target: []const u8) bool {
+    if (std.mem.eql(u8, target, "/dev/null")) return true;
+    if (comptime @import("builtin").os.tag == .windows) {
+        if (std.ascii.eqlIgnoreCase(target, "nul")) return true;
     }
     return false;
 }
@@ -702,6 +815,23 @@ test "command injection redirect blocked" {
     try std.testing.expect(!p.isCommandAllowed("ls >> /tmp/exfil.txt"));
 }
 
+test "null sink redirect is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("echo ok >/dev/null"));
+    try std.testing.expect(p.isCommandAllowed("echo ok 2>/dev/null"));
+    try std.testing.expect(p.isCommandAllowed("echo ok >\"/dev/null\""));
+    if (comptime @import("builtin").os.tag == .windows) {
+        try std.testing.expect(p.isCommandAllowed("echo ok >NUL"));
+    } else {
+        try std.testing.expect(!p.isCommandAllowed("echo ok >NUL"));
+    }
+}
+
+test "quoted greater-than is not treated as redirection" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("echo \"a > b\""));
+}
+
 test "command injection dollar brace blocked" {
     const p = SecurityPolicy{};
     try std.testing.expect(!p.isCommandAllowed("echo ${IFS}cat${IFS}/etc/passwd"));
@@ -1014,6 +1144,25 @@ test "default allowed commands includes expected tools" {
     try std.testing.expect(found_npm);
     try std.testing.expect(found_cargo);
     try std.testing.expect(found_ls);
+}
+
+test "resolveAllowedCommands full autonomy defaults to wildcard when unset" {
+    const resolved = resolveAllowedCommands(.full, &.{});
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqualStrings("*", resolved[0]);
+}
+
+test "resolveAllowedCommands supervised defaults to conservative set when unset" {
+    const resolved = resolveAllowedCommands(.supervised, &.{});
+    try std.testing.expectEqualStrings("git", resolved[0]);
+    try std.testing.expect(resolved.len >= 1);
+}
+
+test "resolveAllowedCommands preserves explicit configured list" {
+    const custom = [_][]const u8{"taskkill"};
+    const resolved = resolveAllowedCommands(.full, &custom);
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqualStrings("taskkill", resolved[0]);
 }
 
 test "blocks single ampersand background chaining" {
@@ -1409,6 +1558,18 @@ test "full autonomy wildcard end-to-end: validateCommandExecution passes" {
     // Low-risk commands pass
     const risk3 = try p.validateCommandExecution("ls -la", false);
     try std.testing.expectEqual(CommandRiskLevel.low, risk3);
+}
+
+test "wildcard policy allows stderr redirect to dev null for shell workflows" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+    };
+
+    try std.testing.expect(p.isCommandAllowed("find ~ -maxdepth 2 -name \"secrets.json\" -o -name \".env\" 2>/dev/null | head -5"));
+    try std.testing.expect(!p.isCommandAllowed("find ~ -maxdepth 2 -name \"secrets.json\" 2>/tmp/leak.log"));
 }
 
 test "full autonomy wildcard: arbitrary commands allowed" {

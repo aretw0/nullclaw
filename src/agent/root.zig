@@ -305,6 +305,12 @@ pub const Agent = struct {
     usage_record_callback: ?UsageRecordCallback = null,
     /// Context pointer passed to usage_record_callback.
     usage_record_ctx: ?*anyopaque = null,
+    /// Cross-thread interrupt flag used to stop in-flight tool loops.
+    interrupt_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Tracks currently running tool and effective interruptions for user-facing reporting.
+    tool_state_mu: std.Thread.Mutex = .{},
+    active_tool_name: ?[]u8 = null,
+    interrupted_tools: std.ArrayListUnmanaged([]u8) = .empty,
     /// Conversation context for the current turn (Signal-specific for now).
     conversation_context: ?prompt.ConversationContext = null,
 
@@ -432,11 +438,97 @@ pub const Agent = struct {
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
         if (self.focus_target_owned and self.focus_target != null) self.allocator.free(self.focus_target.?);
         if (self.dock_target_owned and self.dock_target != null) self.allocator.free(self.dock_target.?);
+        self.tool_state_mu.lock();
+        if (self.active_tool_name) |name| self.allocator.free(name);
+        self.active_tool_name = null;
+        for (self.interrupted_tools.items) |name| self.allocator.free(name);
+        self.interrupted_tools.deinit(self.allocator);
+        self.tool_state_mu.unlock();
         for (self.history.items) |*msg| {
             msg.deinit(self.allocator);
         }
         self.history.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
+    }
+
+    pub fn requestInterrupt(self: *Agent) void {
+        self.interrupt_requested.store(true, .release);
+    }
+
+    pub fn clearInterruptRequest(self: *Agent) void {
+        self.interrupt_requested.store(false, .release);
+    }
+
+    fn isInterruptRequested(self: *const Agent) bool {
+        return self.interrupt_requested.load(.acquire);
+    }
+
+    fn setActiveToolName(self: *Agent, name: []const u8) !void {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        if (self.active_tool_name) |old| self.allocator.free(old);
+        self.active_tool_name = try self.allocator.dupe(u8, name);
+    }
+
+    fn clearActiveToolName(self: *Agent) void {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        if (self.active_tool_name) |old| self.allocator.free(old);
+        self.active_tool_name = null;
+    }
+
+    fn noteInterruptedTool(self: *Agent, name: []const u8) !void {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        for (self.interrupted_tools.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing, name)) return;
+        }
+        try self.interrupted_tools.append(self.allocator, try self.allocator.dupe(u8, name));
+    }
+
+    fn takeInterruptedToolsSummary(self: *Agent) !?[]u8 {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        if (self.interrupted_tools.items.len == 0) return null;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        for (self.interrupted_tools.items, 0..) |name, i| {
+            if (i > 0) try out.appendSlice(self.allocator, ", ");
+            try out.appendSlice(self.allocator, name);
+        }
+
+        for (self.interrupted_tools.items) |name| self.allocator.free(name);
+        self.interrupted_tools.clearRetainingCapacity();
+
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    pub fn snapshotActiveToolName(self: *Agent, allocator: std.mem.Allocator) !?[]u8 {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        if (self.active_tool_name) |name| {
+            return try allocator.dupe(u8, name);
+        }
+        return null;
+    }
+
+    fn interruptedReply(self: *Agent) ![]const u8 {
+        self.clearInterruptRequest();
+        const summary = try self.takeInterruptedToolsSummary();
+        defer if (summary) |s| self.allocator.free(s);
+        const msg = if (summary) |tools|
+            try std.fmt.allocPrint(self.allocator, "Interrupted by /stop. Interrupted tools: {s}.", .{tools})
+        else
+            try self.allocator.dupe(u8, "Interrupted by /stop. Halting tool execution for this turn.");
+        errdefer self.allocator.free(msg);
+        try self.history.append(self.allocator, .{
+            .role = .assistant,
+            .content = try self.allocator.dupe(u8, msg),
+        });
+        const complete_event = ObserverEvent{ .turn_complete = {} };
+        self.observer.recordEvent(&complete_event);
+        return msg;
     }
 
     /// Estimate total tokens in conversation history.
@@ -585,6 +677,20 @@ pub const Agent = struct {
 
     fn composeFinalReply(self: *const Agent, base_text: []const u8, reasoning_content: ?[]const u8, usage: providers.TokenUsage) ![]const u8 {
         return commands.composeFinalReply(self, base_text, reasoning_content, usage);
+    }
+
+    fn selectDisplayText(response_text: []const u8, parsed_text: []const u8, parsed_calls_len: usize) []const u8 {
+        if (parsed_calls_len > 0) return parsed_text;
+        if (parsed_text.len > 0) {
+            // Some malformed/unclosed tool-call payloads can survive into parsed_text
+            // via parser recovery fallbacks. Suppress them from user-visible output.
+            if (dispatcher.containsToolCallMarkup(parsed_text)) return "";
+            return parsed_text;
+        }
+        // If tool-call markup exists but parsing produced no valid calls/text,
+        // never show the raw payload to the user.
+        if (dispatcher.containsToolCallMarkup(response_text)) return "";
+        return response_text;
     }
 
     fn shouldForceActionFollowThrough(text: []const u8) bool {
@@ -987,6 +1093,10 @@ pub const Agent = struct {
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
+            if (self.isInterruptRequested()) {
+                return self.interruptedReply();
+            }
+
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
 
@@ -1167,9 +1277,17 @@ pub const Agent = struct {
             } };
             self.observer.recordEvent(&resp_event);
 
-            // Track tokens
-            self.total_tokens += response.usage.total_tokens;
-            self.last_turn_usage = response.usage;
+            // Track tokens with provider-agnostic fallback when total is omitted.
+            var normalized_usage = response.usage;
+            if (normalized_usage.total_tokens == 0 and
+                (normalized_usage.prompt_tokens > 0 or normalized_usage.completion_tokens > 0))
+            {
+                normalized_usage.total_tokens = normalized_usage.prompt_tokens +| normalized_usage.completion_tokens;
+            }
+            response.usage = normalized_usage;
+
+            self.total_tokens += normalized_usage.total_tokens;
+            self.last_turn_usage = normalized_usage;
             self.emitUsageRecord(&response, true);
 
             const response_text = response.contentOrEmpty();
@@ -1238,12 +1356,7 @@ pub const Agent = struct {
             // When tool calls are present, only show parsed plain text (if any).
             // Never fall back to raw response_text here, otherwise markup like
             // <tool_call>...</tool_call> can leak to users.
-            const display_text = if (parsed_calls.len > 0)
-                parsed_text
-            else if (parsed_text.len > 0)
-                parsed_text
-            else
-                response_text;
+            const display_text = selectDisplayText(response_text, parsed_text, parsed_calls.len);
 
             if (parsed_calls.len == 0) {
                 // Guardrail: if the model promises "I'll try/check now" but emits no
@@ -1379,6 +1492,11 @@ pub const Agent = struct {
             }
 
             for (parsed_calls, 0..) |call, idx| {
+                if (self.isInterruptRequested()) {
+                    self.freeResponseFields(&response);
+                    return self.interruptedReply();
+                }
+
                 if (self.log_tool_calls) {
                     log.info(
                         "tool-call start session=0x{x} index={d} name={s} id={s}",
@@ -1592,6 +1710,15 @@ pub const Agent = struct {
     }
 
     fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
+        if (self.isInterruptRequested()) {
+            return .{
+                .name = call.name,
+                .output = "Interrupted by /stop",
+                .success = false,
+                .tool_call_id = call.tool_call_id,
+            };
+        }
+
         // Policy gate: check autonomy and rate limit
         if (self.policy) |pol| {
             if (!pol.canAct()) {
@@ -1656,6 +1783,12 @@ pub const Agent = struct {
                     }
                 }
 
+                self.setActiveToolName(trimmed_call_name) catch {};
+                defer self.clearActiveToolName();
+                tools_mod.process_util.setThreadInterruptFlag(&self.interrupt_requested);
+                defer tools_mod.process_util.setThreadInterruptFlag(null);
+                @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
+                defer @import("../http_util.zig").setThreadInterruptFlag(null);
                 const result = t.execute(tool_allocator, args) catch |err| {
                     return .{
                         .name = call.name,
@@ -1664,6 +1797,12 @@ pub const Agent = struct {
                         .tool_call_id = call.tool_call_id,
                     };
                 };
+                const was_interrupted = !result.success and
+                    ((result.error_msg != null and std.mem.indexOf(u8, result.error_msg.?, "Interrupted by /stop") != null) or
+                        std.mem.indexOf(u8, result.output, "Interrupted by /stop") != null);
+                if (was_interrupted) {
+                    self.noteInterruptedTool(trimmed_call_name) catch {};
+                }
                 return .{
                     .name = call.name,
                     .output = if (result.success) result.output else (result.error_msg orelse result.output),
@@ -1720,7 +1859,7 @@ pub const Agent = struct {
                     msg.content.len,
                     parts_count,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -1743,7 +1882,7 @@ pub const Agent = struct {
                 response.tool_calls.len,
                 std.json.fmt(response.usage, .{}),
                 std.json.fmt(preview.slice, .{}),
-                if (preview.truncated) " [truncated]" else "",
+                if (preview.truncated) " [log preview truncated]" else "",
             },
         );
 
@@ -1757,7 +1896,7 @@ pub const Agent = struct {
                     attempt,
                     reasoning.len,
                     std.json.fmt(r_preview.slice, .{}),
-                    if (r_preview.truncated) " [truncated]" else "",
+                    if (r_preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -1774,7 +1913,7 @@ pub const Agent = struct {
                     if (tc.id.len > 0) tc.id else "-",
                     tc.name,
                     std.json.fmt(args_preview.slice, .{}),
-                    if (args_preview.truncated) " [truncated]" else "",
+                    if (args_preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -2622,10 +2761,43 @@ test "Agent clearHistory then add messages" {
 // ── Slash Command Tests ──────────────────────────────────────────
 
 fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator_.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator_.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy-test-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const dummy_vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supportsNativeTools,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+
     var noop = observability.NoopObserver{};
     return Agent{
         .allocator = allocator,
-        .provider = undefined,
+        .provider = .{ .ptr = @ptrFromInt(1), .vtable = &dummy_vtable },
         .tools = &.{},
         .tool_specs = try allocator.alloc(ToolSpec, 0),
         .mem = null,
@@ -3663,6 +3835,181 @@ test "slash /stop handled explicitly" {
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "No active background task") != null);
+}
+
+test "slash /abort aliases /stop" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = (try agent.handleSlashCommand("/abort")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "No active background task") != null);
+}
+
+test "turn returns interruption reply when interrupt requested" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.requestInterrupt();
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+}
+
+test "interruption reply lists effectively interrupted tools" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.noteInterruptedTool("shell");
+    try agent.noteInterruptedTool("web_fetch");
+    agent.requestInterrupt();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted tools: shell, web_fetch") != null);
+}
+
+test "hard stop mock interruption lists exactly interrupted tool" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const ProbeTool = struct {
+        const Self = @This();
+        started: *std.atomic.Value(bool),
+
+        pub const tool_name = "hard_stop_probe";
+        pub const tool_description = "Mock long-running tool for hard-stop tests";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.started.store(true, .release);
+            const proc = tools_mod.process_util;
+            const result = try proc.run(allocator, &.{ "sh", "-c", "sleep 5; echo done" }, .{});
+            defer result.deinit(allocator);
+            if (result.interrupted) {
+                return .{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
+            }
+            return .{ .success = true, .output = try allocator.dupe(u8, "probe-finished") };
+        }
+    };
+
+    const OneShotToolProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "call-hard-stop"),
+                .name = try allocator.dupe(u8, "hard_stop_probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "running"),
+                .tool_calls = tool_calls,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "one-shot-tool-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const InterruptCtx = struct {
+        agent: *Agent,
+        started: *std.atomic.Value(bool),
+    };
+    const InterruptWorker = struct {
+        fn run(ctx: *InterruptCtx) void {
+            while (!ctx.started.load(.acquire)) {
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+            std.Thread.sleep(80 * std.time.ns_per_ms);
+            ctx.agent.requestInterrupt();
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var started = std.atomic.Value(bool).init(false);
+    var tool_impl = ProbeTool{ .started = &started };
+    const tools = [_]Tool{tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tools.len);
+    for (tools, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var provider_state = OneShotToolProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = OneShotToolProvider.chatWithSystem,
+        .chat = OneShotToolProvider.chat,
+        .supportsNativeTools = OneShotToolProvider.supportsNativeTools,
+        .getName = OneShotToolProvider.getName,
+        .deinit = OneShotToolProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tools,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    var interrupt_ctx = InterruptCtx{ .agent = &agent, .started = &started };
+    const interrupt_thread = try std.Thread.spawn(.{}, InterruptWorker.run, .{&interrupt_ctx});
+    defer interrupt_thread.join();
+
+    const response = try agent.turn("run hard stop mock");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "hard_stop_probe") != null);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
 }
 
 test "slash /approve executes pending bash command" {
@@ -4779,6 +5126,29 @@ test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("Вот результат: файл успешно отправлен."));
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
+}
+
+test "Agent selectDisplayText hides malformed tool markup payload" {
+    const raw = "<tool_call>web_search<arg_key>query</arg_key><arg_value>x</arg_value></tool_call>";
+    const selected = Agent.selectDisplayText(raw, "", 0);
+    try std.testing.expectEqualStrings("", selected);
+}
+
+test "Agent selectDisplayText keeps plain text when no markup exists" {
+    const raw = "All good.";
+    const selected = Agent.selectDisplayText(raw, "", 0);
+    try std.testing.expectEqualStrings("All good.", selected);
+}
+
+test "Agent selectDisplayText prefers parsed text when present" {
+    const selected = Agent.selectDisplayText("<tool_call>{}</tool_call>", "let me check", 1);
+    try std.testing.expectEqualStrings("let me check", selected);
+}
+
+test "Agent selectDisplayText hides malformed tool markup present in parsed text" {
+    const parsed_with_markup = "Some text <tool_call>{\"name\":\"shell\"";
+    const selected = Agent.selectDisplayText(parsed_with_markup, parsed_with_markup, 0);
+    try std.testing.expectEqualStrings("", selected);
 }
 
 test "Agent.fromConfig sets exec_security=full for full autonomy" {

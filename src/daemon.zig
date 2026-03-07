@@ -709,7 +709,7 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web");
+        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web") or std.mem.eql(u8, msg.channel, "telegram");
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
@@ -717,18 +717,26 @@ fn inboundDispatcherThread(
             .account_id = outbound_account_id,
             .chat_id = msg.chat_id,
         };
+        var stream_sink: ?streaming.Sink = null;
+        var outbound_tag_filter: streaming.TagFilter = undefined;
+        if (use_streaming_outbound) {
+            const raw_sink = streaming.Sink{
+                .callback = publishStreamingChunk,
+                .ctx = @ptrCast(&streaming_ctx),
+            };
+            if (std.mem.eql(u8, msg.channel, "telegram")) {
+                outbound_tag_filter = streaming.TagFilter.init(raw_sink);
+                stream_sink = outbound_tag_filter.sink();
+            } else {
+                stream_sink = raw_sink;
+            }
+        }
 
         const reply = runtime.session_mgr.processMessageStreaming(
             session_key,
             msg.content,
             null,
-            if (use_streaming_outbound)
-                streaming.Sink{
-                    .callback = publishStreamingChunk,
-                    .ctx = @ptrCast(&streaming_ctx),
-                }
-            else
-                null,
+            stream_sink,
         ) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 

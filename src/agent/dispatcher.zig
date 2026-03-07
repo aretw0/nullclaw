@@ -62,6 +62,15 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Detect whether the response contains explicit tool-call markup tags.
+/// Used by the agent loop to avoid leaking raw tool XML-like payloads to users
+/// when parsing fails on malformed inner content.
+pub fn containsToolCallMarkup(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "<tool_call>") != null or
+        std.mem.indexOf(u8, text, "[TOOL_CALL]") != null or
+        std.mem.indexOf(u8, text, "[tool_call]") != null;
+}
+
 /// Parse tool calls from an LLM response using XML-style `<tool_call>` tags.
 ///
 /// Expected format:
@@ -1558,6 +1567,20 @@ test "parseToolCalls malformed JSON inside tag" {
     try std.testing.expectEqual(@as(usize, 0), result.calls.len);
 }
 
+test "parseToolCalls malformed xml-like arg_key payload is skipped" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_call>web_search<arg_key>query</arg_key><arg_value>manelsen amelie github lattes</arg_value><arg_key>count</arg_key><arg_value>5</arg_value></tool_call>
+    ;
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        if (result.text.len > 0) allocator.free(result.text);
+        allocator.free(result.calls);
+    }
+    try std.testing.expectEqualStrings("", result.text);
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
+}
+
 test "parseToolCalls empty arguments defaults to empty object" {
     const allocator = std.testing.allocator;
     const response = "<tool_call>{\"name\": \"shell\"}</tool_call>";
@@ -2184,6 +2207,13 @@ test "isNativeJsonFormat true with leading whitespace" {
     try std.testing.expect(isNativeJsonFormat(
         \\  {"tool_calls":[{"id":"1","type":"function","function":{"name":"x","arguments":"{}"}}]}
     ));
+}
+
+test "containsToolCallMarkup detects xml and bracket variants" {
+    try std.testing.expect(containsToolCallMarkup("<tool_call>{}</tool_call>"));
+    try std.testing.expect(containsToolCallMarkup("[TOOL_CALL]{\"name\":\"shell\"}[/TOOL_CALL]"));
+    try std.testing.expect(containsToolCallMarkup("[tool_call]{\"name\":\"shell\"}[/tool_call]"));
+    try std.testing.expect(!containsToolCallMarkup("plain reply text"));
 }
 
 test "isNativeJsonFormat false for XML response" {

@@ -1,3 +1,5 @@
+**Official website:** [nullclaw.io](https://nullclaw.io)
+
 <p align="center">
   <img src="nullclaw.png" alt="nullclaw" width="200" />
 </p>
@@ -20,18 +22,6 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 ```
 678 KB binary · <2 ms startup · 3,230+ tests · 23+ providers · 18 channels · Pluggable everything
 ```
-
-## 中文文档
-
-- [中文文档总览](docs/zh/README.md)
-- [安装指南](docs/zh/installation.md)
-- [配置指南](docs/zh/configuration.md)
-- [使用与运维](docs/zh/usage.md)
-- [架构总览](docs/zh/architecture.md)
-- [安全机制](docs/zh/security.md)
-- [Gateway API](docs/zh/gateway-api.md)
-- [命令参考](docs/zh/commands.md)
-- [开发指南](docs/zh/development.md)
 
 ### Features
 
@@ -77,6 +67,8 @@ ls -lh zig-out/bin/nullclaw
 ## Quick Start
 
 ### 1) Recommended install (Homebrew)
+
+The simplest path: install a ready-to-run binary with no extra runtime dependencies.
 
 ```bash
 brew install nullclaw
@@ -633,6 +625,18 @@ Implement a vtable interface, submit a PR:
 - New `Sandbox` backend -> `src/security/`
 - New `Peripheral` -> `src/peripherals.zig`
 - New `Skill` -> `~/.nullclaw/workspace/skills/<name>/`
+
+## 中文文档
+
+- [中文文档总览](docs/zh/README.md)
+- [安装指南](docs/zh/installation.md)
+- [配置指南](docs/zh/configuration.md)
+- [使用与运维](docs/zh/usage.md)
+- [架构总览](docs/zh/architecture.md)
+- [安全机制](docs/zh/security.md)
+- [Gateway API](docs/zh/gateway-api.md)
+- [命令参考](docs/zh/commands.md)
+- [开发指南](docs/zh/development.md)
 
 ## Disclaimer
 

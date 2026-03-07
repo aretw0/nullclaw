@@ -135,6 +135,9 @@ pub const ShellTool = struct {
             return ToolResult{ .success = true, .output = try allocator.dupe(u8, "(no output)") };
         }
         defer allocator.free(result.stdout);
+        if (result.interrupted) {
+            return ToolResult{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
+        }
         if (result.exit_code != null) {
             const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "Command failed with non-zero exit code");
             return ToolResult{ .success = false, .output = "", .error_msg = err_out };
@@ -195,6 +198,26 @@ test "shell captures failing command" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
+}
+
+test "shell reports interruption when cancel flag is set" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var st = ShellTool{ .workspace_dir = "." };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"command\": \"sleep 5\"}");
+    defer parsed.deinit();
+
+    var cancel = std.atomic.Value(bool).init(true);
+    @import("process_util.zig").setThreadInterruptFlag(&cancel);
+    defer @import("process_util.zig").setThreadInterruptFlag(null);
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Interrupted") != null);
 }
 
 test "shell missing command param" {
@@ -419,6 +442,32 @@ test "shell wildcard policy permits command outside default allowlist" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
+}
+
+test "shell wildcard policy allows stderr redirect to dev null" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    var wildcard_policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &wildcard_policy };
+    const parsed = try root.parseTestArgs("{\"command\": \"ls /definitely-missing-file 2>/dev/null || echo missing\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "missing") != null);
 }
 
 test "shell accepts markdown-fenced command payload" {

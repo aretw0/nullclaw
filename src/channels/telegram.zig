@@ -5,12 +5,15 @@ const voice = @import("../voice.zig");
 const platform = @import("../platform.zig");
 const config_types = @import("../config_types.zig");
 const interaction_choices = @import("../interactions/choices.zig");
+const streaming = @import("../streaming.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
+const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 64;
+const DRAFT_FLUSH_MIN_INTERVAL_MS: i64 = 200;
 const TELEGRAM_BOT_COMMANDS_JSON =
     \\{"commands":[
     \\{"command":"start","description":"Start a conversation"},
@@ -114,6 +117,17 @@ const PendingInteraction = struct {
         if (self.owner_identity) |owner| allocator.free(owner);
         for (self.options) |opt| opt.deinit(allocator);
         allocator.free(self.options);
+    }
+};
+
+const DraftState = struct {
+    draft_id: u64,
+    buffer: std.ArrayListUnmanaged(u8) = .empty,
+    last_flush_len: usize = 0,
+    last_flush_time: i64 = 0,
+
+    fn deinit(self: *DraftState, allocator: std.mem.Allocator) void {
+        self.buffer.deinit(allocator);
     }
 };
 
@@ -463,6 +477,11 @@ pub const TelegramChannel = struct {
     pending_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty,
     interaction_seq: Atomic(u64) = Atomic(u64).init(1),
 
+    draft_mu: std.Thread.Mutex = .{},
+    draft_buffers: std.StringHashMapUnmanaged(DraftState) = .empty,
+    draft_id_counter: Atomic(u64) = Atomic(u64).init(1),
+    streaming_enabled: bool = true,
+
     pub const MAX_MESSAGE_LEN: usize = 4096;
     const TYPING_INTERVAL_NS: u64 = 4 * std.time.ns_per_s;
     const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
@@ -505,6 +524,7 @@ pub const TelegramChannel = struct {
         ch.proxy = cfg.proxy;
         ch.interactive = cfg.interactive;
         ch.require_mention = cfg.require_mention;
+        ch.streaming_enabled = cfg.streaming;
         return ch;
     }
 
@@ -2328,6 +2348,7 @@ pub const TelegramChannel = struct {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
         self.stopAllTyping();
         self.deinitPendingInteractions();
+        self.deinitDraftBuffers();
         // Clean up buffered media group messages to prevent shutdown leaks.
         self.resetPendingMediaBuffers();
         self.pending_media_messages.deinit(self.allocator);
@@ -2338,6 +2359,130 @@ pub const TelegramChannel = struct {
             self.bot_username = null;
         }
         self.bot_user_id = null;
+    }
+
+    // ── Draft streaming (sendMessageDraft) ─────────────────────────
+
+    fn deinitDraftBuffers(self: *TelegramChannel) void {
+        var it = self.draft_buffers.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.draft_buffers.deinit(self.allocator);
+    }
+
+    fn sendDraft(self: *TelegramChannel, chat_id: []const u8, draft_id: u64, text: []const u8) void {
+        if (builtin.is_test) return;
+        if (text.len == 0) return;
+
+        var url_buf: [512]u8 = undefined;
+        const url = self.apiUrl(&url_buf, "sendMessageDraft") catch return;
+
+        // Try HTML conversion, fall back to plain text.
+        const html_text = markdownToTelegramHtml(self.allocator, text) catch null;
+        defer if (html_text) |h| self.allocator.free(h);
+
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+
+        body.appendSlice(self.allocator, "{\"chat_id\":") catch return;
+        body.appendSlice(self.allocator, chat_id) catch return;
+        body.appendSlice(self.allocator, ",\"draft_id\":") catch return;
+        var id_buf: [20]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{draft_id}) catch return;
+        body.appendSlice(self.allocator, id_str) catch return;
+        body.appendSlice(self.allocator, ",\"text\":") catch return;
+        if (html_text) |h| {
+            root.json_util.appendJsonString(&body, self.allocator, h) catch return;
+            body.appendSlice(self.allocator, ",\"parse_mode\":\"HTML\"") catch return;
+        } else {
+            root.json_util.appendJsonString(&body, self.allocator, text) catch return;
+        }
+        body.appendSlice(self.allocator, "}") catch return;
+
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body.items, &.{}, self.proxy, "10") catch |err| {
+            log.warn("sendMessageDraft request failed: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(resp);
+
+        if (responseHasTelegramError(resp)) {
+            log.warn("sendMessageDraft API error: {s}", .{resp[0..@min(resp.len, 256)]});
+        }
+    }
+
+    /// Staged outbound event handler for draft streaming.
+    ///
+    /// - `.chunk`: Accumulates text in a per-chat draft buffer and periodically
+    ///   flushes it to Telegram via `sendMessageDraft`, giving users a live
+    ///   preview of the response as it is generated.
+    /// - `.final`: Cleans up the draft buffer and delivers the complete message
+    ///   through the normal `vtableSend` path (which handles attachment markers,
+    ///   interactive buttons, and message splitting). Callers must pass the full
+    ///   reply text as `message` for `.final`; an empty message skips delivery.
+    fn vtableSendEvent(
+        ptr: *anyopaque,
+        target: []const u8,
+        message: []const u8,
+        _: []const []const u8,
+        stage: root.Channel.OutboundStage,
+    ) anyerror!void {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        if (!self.streaming_enabled) {
+            if (stage == .final and message.len > 0) {
+                return vtableSend(ptr, target, message, &.{});
+            }
+            return;
+        }
+
+        switch (stage) {
+            .chunk => {
+                if (message.len == 0) return;
+
+                self.draft_mu.lock();
+                defer self.draft_mu.unlock();
+
+                const gop = try self.draft_buffers.getOrPut(self.allocator, target);
+                if (!gop.found_existing) {
+                    const key_copy = try self.allocator.dupe(u8, target);
+                    gop.key_ptr.* = key_copy;
+                    gop.value_ptr.* = .{
+                        .draft_id = self.draft_id_counter.fetchAdd(1, .monotonic),
+                    };
+                }
+
+                try gop.value_ptr.buffer.appendSlice(self.allocator, message);
+
+                const delta = gop.value_ptr.buffer.items.len - gop.value_ptr.last_flush_len;
+                const now_ms = std.time.milliTimestamp();
+                const elapsed_ms = now_ms - gop.value_ptr.last_flush_time;
+
+                if (delta >= DRAFT_FLUSH_MIN_DELTA_BYTES or elapsed_ms >= DRAFT_FLUSH_MIN_INTERVAL_MS) {
+                    self.sendDraft(target, gop.value_ptr.draft_id, gop.value_ptr.buffer.items);
+                    gop.value_ptr.last_flush_len = gop.value_ptr.buffer.items.len;
+                    gop.value_ptr.last_flush_time = now_ms;
+                }
+            },
+            .final => {
+                {
+                    self.draft_mu.lock();
+                    defer self.draft_mu.unlock();
+
+                    if (self.draft_buffers.fetchRemove(target)) |entry| {
+                        self.allocator.free(entry.key);
+                        var draft = entry.value;
+                        draft.deinit(self.allocator);
+                    }
+                }
+                // Forward the final message through the normal send path.
+                // Once sendEvent is set in the vtable, the Channel wrapper no
+                // longer falls through to send(), so we must deliver it here.
+                if (message.len > 0) {
+                    try vtableSend(ptr, target, message, &.{});
+                }
+            },
+        }
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
@@ -2376,6 +2521,7 @@ pub const TelegramChannel = struct {
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
+        .sendEvent = &vtableSendEvent,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
@@ -2384,6 +2530,33 @@ pub const TelegramChannel = struct {
 
     pub fn channel(self: *TelegramChannel) root.Channel {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    // ── Streaming sink ─────────────────────────────────────────────
+
+    pub const StreamCtx = struct {
+        tg_ptr: *TelegramChannel,
+        chat_id: []const u8,
+        filter: streaming.TagFilter = undefined,
+    };
+
+    fn streamCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
+        if (event.stage != .chunk or event.text.len == 0) return;
+        const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
+        ctx.tg_ptr.channel().sendEvent(ctx.chat_id, event.text, &.{}, .chunk) catch {};
+    }
+
+    /// Build a streaming sink backed by the given context.
+    /// Returns null if streaming is disabled. Caller owns the lifetime of `ctx`.
+    /// Chunks are filtered through a TagFilter to strip tool_call markup.
+    pub fn makeSink(self: *TelegramChannel, ctx: *StreamCtx) ?streaming.Sink {
+        if (!self.streaming_enabled) return null;
+        const raw = streaming.Sink{
+            .callback = streamCallback,
+            .ctx = @ptrCast(ctx),
+        };
+        ctx.filter = streaming.TagFilter.init(raw);
+        return ctx.filter.sink();
     }
 };
 
@@ -4393,4 +4566,104 @@ test "telegram consumeCallbackSelection rejects expired interaction" {
         .expired, .not_found => {},
         else => return error.TestUnexpectedResult,
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Draft Streaming Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "DraftState deinit frees buffer" {
+    const allocator = std.testing.allocator;
+    var draft = DraftState{
+        .draft_id = 1,
+    };
+    try draft.buffer.appendSlice(allocator, "hello world");
+    draft.deinit(allocator);
+}
+
+test "vtableSendEvent chunk accumulates in draft buffer" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    try ch.channel().sendEvent("12345", "Hello ", &.{}, .chunk);
+    try ch.channel().sendEvent("12345", "world", &.{}, .chunk);
+
+    ch.draft_mu.lock();
+    defer ch.draft_mu.unlock();
+    const draft = ch.draft_buffers.get("12345") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Hello world", draft.buffer.items);
+}
+
+test "vtableSendEvent final cleans up draft state" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    try ch.channel().sendEvent("12345", "chunk data", &.{}, .chunk);
+
+    // Verify draft exists
+    {
+        ch.draft_mu.lock();
+        defer ch.draft_mu.unlock();
+        try std.testing.expect(ch.draft_buffers.get("12345") != null);
+    }
+
+    // Send final — should clean up
+    try ch.channel().sendEvent("12345", "", &.{}, .final);
+
+    {
+        ch.draft_mu.lock();
+        defer ch.draft_mu.unlock();
+        try std.testing.expect(ch.draft_buffers.get("12345") == null);
+    }
+}
+
+test "vtableSendEvent chunk assigns unique draft_id per chat" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    try ch.channel().sendEvent("111", "a", &.{}, .chunk);
+    try ch.channel().sendEvent("222", "b", &.{}, .chunk);
+
+    ch.draft_mu.lock();
+    defer ch.draft_mu.unlock();
+    const d1 = ch.draft_buffers.get("111") orelse return error.TestUnexpectedResult;
+    const d2 = ch.draft_buffers.get("222") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(d1.draft_id != d2.draft_id);
+}
+
+test "vtableSendEvent disabled streaming is noop" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    ch.streaming_enabled = false;
+    defer ch.deinitDraftBuffers();
+
+    try ch.channel().sendEvent("12345", "data", &.{}, .chunk);
+
+    ch.draft_mu.lock();
+    defer ch.draft_mu.unlock();
+    try std.testing.expect(ch.draft_buffers.get("12345") == null);
+}
+
+test "vtableSendEvent empty chunk is ignored" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    try ch.channel().sendEvent("12345", "", &.{}, .chunk);
+
+    ch.draft_mu.lock();
+    defer ch.draft_mu.unlock();
+    try std.testing.expect(ch.draft_buffers.get("12345") == null);
+}
+
+test "vtableSendEvent final on nonexistent chat is safe" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    // Should not panic or error
+    try ch.channel().sendEvent("nonexistent", "", &.{}, .final);
 }
