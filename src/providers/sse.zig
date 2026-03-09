@@ -1,6 +1,29 @@
 const std = @import("std");
 const root = @import("root.zig");
 const http_util = @import("../http_util.zig");
+const log = std.log.scoped(.provider_sse);
+
+fn finalizeStreamResult(
+    allocator: std.mem.Allocator,
+    accumulated: []const u8,
+    output_tokens: ?u32,
+) !root.StreamChatResult {
+    const content = if (accumulated.len > 0)
+        try allocator.dupe(u8, accumulated)
+    else
+        null;
+
+    const completion_tokens = if (output_tokens) |ot|
+        (if (ot > 0) ot else @as(u32, @intCast((accumulated.len + 3) / 4)))
+    else
+        @as(u32, @intCast((accumulated.len + 3) / 4));
+
+    return .{
+        .content = content,
+        .usage = .{ .completion_tokens = completion_tokens },
+        .model = "",
+    };
+}
 
 /// Result of parsing a single SSE line.
 pub const SseLineResult = union(enum) {
@@ -206,25 +229,37 @@ pub fn curlStream(
         if (n == 0) break;
     }
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curlStream child.wait failed: {}", .{err});
+        if (saw_done) {
+            log.warn("curlStream proceeding despite wait failure after receiving stream data", .{});
+            callback(ctx, root.StreamChunk.finalChunk());
+            return finalizeStreamResult(allocator, accumulated.items, null);
+        }
+        return error.CurlWaitError;
+    };
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            if (saw_done) {
+                log.warn("curlStream exit code {d} after stream data; returning accumulated output", .{code});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, null);
+            }
+            return error.CurlFailed;
+        },
+        else => {
+            if (saw_done) {
+                log.warn("curlStream abnormal termination after stream data; returning accumulated output", .{});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, null);
+            }
+            return error.CurlFailed;
+        },
     }
 
     // Signal stream completion only after curl exits successfully.
     callback(ctx, root.StreamChunk.finalChunk());
-
-    const content = if (accumulated.items.len > 0)
-        try allocator.dupe(u8, accumulated.items)
-    else
-        null;
-
-    return .{
-        .content = content,
-        .usage = .{ .completion_tokens = @intCast((accumulated.items.len + 3) / 4) },
-        .model = "",
-    };
+    return finalizeStreamResult(allocator, accumulated.items, null);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -402,6 +437,7 @@ pub fn curlStreamAnthropic(
 
     var current_event: []const u8 = "";
     var output_tokens: u32 = 0;
+    var saw_done = false;
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
@@ -429,6 +465,7 @@ pub fn curlStreamAnthropic(
                     },
                     .usage => |tokens| output_tokens = tokens,
                     .done => {
+                        saw_done = true;
                         line_buf.clearRetainingCapacity();
                         break :outer;
                     },
@@ -444,37 +481,42 @@ pub fn curlStreamAnthropic(
     // Free owned event string
     if (current_event.len > 0) allocator.free(@constCast(current_event));
 
-    // Send final chunk
-    callback(ctx, root.StreamChunk.finalChunk());
-
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
     }
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curlStreamAnthropic child.wait failed: {}", .{err});
+        if (saw_done) {
+            log.warn("curlStreamAnthropic proceeding despite wait failure after receiving stream data", .{});
+            callback(ctx, root.StreamChunk.finalChunk());
+            return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+        }
+        return error.CurlWaitError;
+    };
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            if (saw_done) {
+                log.warn("curlStreamAnthropic exit code {d} after stream data; returning accumulated output", .{code});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+            }
+            return error.CurlFailed;
+        },
+        else => {
+            if (saw_done) {
+                log.warn("curlStreamAnthropic abnormal termination after stream data; returning accumulated output", .{});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+            }
+            return error.CurlFailed;
+        },
     }
 
-    const content = if (accumulated.items.len > 0)
-        try allocator.dupe(u8, accumulated.items)
-    else
-        null;
-
-    // Use actual output_tokens if reported, otherwise estimate
-    const completion_tokens = if (output_tokens > 0)
-        output_tokens
-    else
-        @as(u32, @intCast((accumulated.items.len + 3) / 4));
-
-    return .{
-        .content = content,
-        .usage = .{ .completion_tokens = completion_tokens },
-        .model = "",
-    };
+    callback(ctx, root.StreamChunk.finalChunk());
+    return finalizeStreamResult(allocator, accumulated.items, output_tokens);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
