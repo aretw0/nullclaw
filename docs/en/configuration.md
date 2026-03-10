@@ -140,6 +140,25 @@ Notes:
 - Auto-routed sessions temporarily degrade a route after quota or rate-limit failures and skip it until the cooldown expires.
 - Route metadata only nudges scoring. Ambiguous prompts still stay on `balanced`; `fast` is reserved for high-confidence cheap tasks, and strong deep-analysis signals still win over cheaper routes.
 
+### `agents.list`
+
+- Defines named agent profiles used by tools such as `/delegate`.
+- Each entry may set `provider` + `model`, or a full `provider/model` ref in `model.primary`.
+- Example:
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "coder",
+        "model": { "primary": "ollama/qwen3.5:cloud" },
+        "system_prompt": "You're an experienced coder"
+      }
+    ]
+  }
+}
+```
 ### `channels`
 
 - Channel config lives under `channels.<name>`.

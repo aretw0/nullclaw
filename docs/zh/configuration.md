@@ -126,6 +126,25 @@ nullclaw onboard --interactive
 - 如果自动路由命中的提供方遇到配额或限流错误，这条路线会被临时降级，直到冷却时间结束才会再次尝试。
 - 路由元数据只会轻微影响评分，不会推翻保守策略。含糊请求仍然优先留在 `balanced`，`fast` 只给高置信度且便宜的任务，强烈的深度分析信号仍然会压过更便宜的路线。
 
+### `agents.list`
+
+- 定义可供 `/delegate` 等工具使用的命名 agent 配置。
+- 每个条目既可以显式写 `provider` + `model`，也可以直接在 `model.primary` 中写完整的 `provider/model` 引用。
+- 示例：
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "coder",
+        "model": { "primary": "ollama/qwen3.5:cloud" },
+        "system_prompt": "You're an experienced coder"
+      }
+    ]
+  }
+}
+```
 ### `channels`
 
 - 渠道配置统一在 `channels.<name>` 下。
