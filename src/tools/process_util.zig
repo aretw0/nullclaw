@@ -161,13 +161,16 @@ fn tryDecodeWindowsOutputToUtf8(allocator: std.mem.Allocator, input: []const u8)
     const console_cp = std.os.windows.kernel32.GetConsoleOutputCP();
     if (try tryDecodeWindowsCodePageToUtf8(allocator, input, console_cp)) |decoded| return decoded;
 
+    // Prefer GBK before ACP: Western single-byte ACPs like CP1252 will happily
+    // decode arbitrary high bytes into mojibake ("ÖÐÎÄ"), which would mask
+    // genuine GBK console output that we can still recover losslessly.
     const ansi_cp = GetACP();
-    if (ansi_cp != console_cp) {
-        if (try tryDecodeWindowsCodePageToUtf8(allocator, input, ansi_cp)) |decoded| return decoded;
-    }
-
     if (console_cp != CP_GBK and ansi_cp != CP_GBK) {
         if (try tryDecodeWindowsCodePageToUtf8(allocator, input, CP_GBK)) |decoded| return decoded;
+    }
+
+    if (ansi_cp != console_cp) {
+        if (try tryDecodeWindowsCodePageToUtf8(allocator, input, ansi_cp)) |decoded| return decoded;
     }
 
     return null;

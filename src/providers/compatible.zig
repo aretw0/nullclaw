@@ -97,6 +97,8 @@ pub const AuthStyle = enum {
 pub const OpenAiCompatibleProvider = struct {
     name: []const u8,
     base_url: []const u8,
+    /// Optional owned copy of base_url when the caller had to normalize/build it.
+    owned_base_url: ?[]u8 = null,
     api_key: ?[]const u8,
     auth_style: AuthStyle,
     /// Custom header name when auth_style is .custom (e.g. "X-Custom-Key").
@@ -943,7 +945,13 @@ pub const OpenAiCompatibleProvider = struct {
         return self.name;
     }
 
-    fn deinitImpl(_: *anyopaque) void {}
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        if (self.owned_base_url) |owned| {
+            self.allocator.free(owned);
+            self.owned_base_url = null;
+        }
+    }
 };
 
 /// Serialize a single message's content field — delegates to shared helper in providers/helpers.zig.

@@ -873,6 +873,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tl.object.get("web_fetch_max_chars")) |v| {
                 if (v == .integer) self.tools.web_fetch_max_chars = @intCast(v.integer);
             }
+            if (tl.object.get("path_env_vars")) |v| {
+                if (v == .array) self.tools.path_env_vars = try parseStringArray(self.allocator, v.array);
+            }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {
                 if (media == .object) {

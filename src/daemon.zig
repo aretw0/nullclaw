@@ -669,6 +669,20 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
     };
 }
 
+fn supportsStreamingOutbound(channel: []const u8) bool {
+    return std.mem.eql(u8, channel, "web") or std.mem.eql(u8, channel, "telegram");
+}
+
+fn makeStreamingSinkForChannel(
+    channel: []const u8,
+    raw_sink: streaming.Sink,
+    filter: *streaming.TagFilter,
+) ?streaming.Sink {
+    if (!supportsStreamingOutbound(channel)) return null;
+    filter.* = streaming.TagFilter.init(raw_sink);
+    return filter.sink();
+}
+
 fn inboundDispatcherThread(
     allocator: std.mem.Allocator,
     event_bus: *bus_mod.Bus,
@@ -710,7 +724,7 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web") or std.mem.eql(u8, msg.channel, "telegram");
+        const use_streaming_outbound = supportsStreamingOutbound(msg.channel);
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
@@ -725,12 +739,7 @@ fn inboundDispatcherThread(
                 .callback = publishStreamingChunk,
                 .ctx = @ptrCast(&streaming_ctx),
             };
-            if (std.mem.eql(u8, msg.channel, "telegram")) {
-                outbound_tag_filter = streaming.TagFilter.init(raw_sink);
-                stream_sink = outbound_tag_filter.sink();
-            } else {
-                stream_sink = raw_sink;
-            }
+            stream_sink = makeStreamingSinkForChannel(msg.channel, raw_sink, &outbound_tag_filter);
         }
 
         const reply = runtime.session_mgr.processMessageStreaming(
@@ -993,6 +1002,55 @@ test "computeBackoff doubles up to max" {
 
 test "computeBackoff saturating" {
     try std.testing.expectEqual(std.math.maxInt(u64), computeBackoff(std.math.maxInt(u64), std.math.maxInt(u64)));
+}
+
+test "makeStreamingSinkForChannel filters web chunks" {
+    const Collector = struct {
+        buf: [128]u8 = undefined,
+        len: usize = 0,
+        got_final: bool = false,
+
+        fn callback(ctx: *anyopaque, event: streaming.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event.stage) {
+                .chunk => {
+                    @memcpy(self.buf[self.len..][0..event.text.len], event.text);
+                    self.len += event.text.len;
+                },
+                .final => self.got_final = true,
+            }
+        }
+
+        fn sink(self: *@This()) streaming.Sink {
+            return .{ .callback = callback, .ctx = @ptrCast(self) };
+        }
+
+        fn text(self: *@This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+
+    var collector = Collector{};
+    var filter: streaming.TagFilter = undefined;
+    const sink = makeStreamingSinkForChannel("web", collector.sink(), &filter).?;
+    sink.emitChunk("A<|tool_call_begin|>{\"name\":\"shell\"}<|tool_call_end|>B");
+    sink.emitFinal();
+
+    try std.testing.expectEqualStrings("AB", collector.text());
+    try std.testing.expect(collector.got_final);
+}
+
+test "makeStreamingSinkForChannel returns null for unsupported channel" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: streaming.Event) void {}
+    };
+
+    var filter: streaming.TagFilter = undefined;
+    const sink = makeStreamingSinkForChannel("discord", .{
+        .callback = Noop.callback,
+        .ctx = undefined,
+    }, &filter);
+    try std.testing.expect(sink == null);
 }
 
 test "hasSupervisedChannels false for defaults" {

@@ -7,6 +7,9 @@ const error_classify = @import("error_classify.zig");
 const verbose = @import("../verbose.zig");
 const log = std.log.scoped(.provider_sse);
 
+var curl_fail_fast_arg_mutex: std.Thread.Mutex = .{};
+var curl_fail_with_body_supported_cache: ?bool = null;
+
 fn finalizeStreamResult(
     allocator: std.mem.Allocator,
     accumulated: []const u8,
@@ -27,6 +30,67 @@ fn finalizeStreamResult(
         .usage = .{ .completion_tokens = completion_tokens },
         .model = "",
     };
+}
+
+fn parseCurlVersionComponent(component: []const u8) ?u32 {
+    var end: usize = 0;
+    while (end < component.len and std.ascii.isDigit(component[end])) : (end += 1) {}
+    if (end == 0) return null;
+    return std.fmt.parseInt(u32, component[0..end], 10) catch null;
+}
+
+fn parseCurlVersionTriplet(version_line: []const u8) ?[3]u32 {
+    const prefix = "curl ";
+    if (!std.mem.startsWith(u8, version_line, prefix)) return null;
+
+    const version_tail = version_line[prefix.len..];
+    const version_end = std.mem.indexOfScalar(u8, version_tail, ' ') orelse version_tail.len;
+    const version_token = version_tail[0..version_end];
+
+    var parts = std.mem.splitScalar(u8, version_token, '.');
+    const major = parseCurlVersionComponent(parts.next() orelse return null) orelse return null;
+    const minor = parseCurlVersionComponent(parts.next() orelse return null) orelse return null;
+    const patch = parseCurlVersionComponent(parts.next() orelse return null) orelse return null;
+    return .{ major, minor, patch };
+}
+
+fn curlVersionSupportsFailWithBody(version_line: []const u8) bool {
+    const version = parseCurlVersionTriplet(version_line) orelse return false;
+    if (version[0] != 7) return version[0] > 7;
+    if (version[1] != 76) return version[1] > 76;
+    return version[2] >= 0;
+}
+
+fn detectCurlFailWithBodySupport(allocator: std.mem.Allocator) bool {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "curl", "--version" },
+        .max_output_bytes = 1024,
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+
+    const trimmed = std.mem.trim(u8, result.stdout, " \n\r\t");
+    var line_it = std.mem.splitScalar(u8, trimmed, '\n');
+    return curlVersionSupportsFailWithBody(line_it.first());
+}
+
+/// Prefer `--fail-with-body` so JSON API errors remain classifiable, but fall
+/// back to `-f` on curl releases older than 7.76.0 where the newer flag fails.
+pub fn curlFailFastArg(allocator: std.mem.Allocator) []const u8 {
+    curl_fail_fast_arg_mutex.lock();
+    defer curl_fail_fast_arg_mutex.unlock();
+
+    if (curl_fail_with_body_supported_cache == null) {
+        curl_fail_with_body_supported_cache = detectCurlFailWithBodySupport(allocator);
+    }
+
+    return if (curl_fail_with_body_supported_cache.?) "--fail-with-body" else "-f";
 }
 
 const CurlBodyArg = struct {
@@ -161,7 +225,8 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
 
 /// Run curl in SSE streaming mode and parse output line by line.
 ///
-/// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
+/// Spawns `curl -s --no-buffer` with the strongest supported fail-fast flag:
+/// `--fail-with-body` on curl >= 7.76.0, otherwise `-f`.
 /// For each SSE delta, calls `callback(ctx, chunk)`.
 /// Returns accumulated result after stream completes.
 pub fn curlStream(
@@ -188,7 +253,7 @@ pub fn curlStream(
     argc += 1;
     argv_buf[argc] = "--no-buffer";
     argc += 1;
-    argv_buf[argc] = "--fail-with-body";
+    argv_buf[argc] = curlFailFastArg(allocator);
     argc += 1;
 
     var timeout_buf: [32]u8 = undefined;
@@ -741,6 +806,19 @@ test "prepareCurlBodyArg uses temp file only on Windows" {
 test "parseSseLine DONE sentinel" {
     const result = try parseSseLine(std.testing.allocator, "data: [DONE]");
     try std.testing.expect(result == .done);
+}
+
+test "curlVersionSupportsFailWithBody rejects curl older than 7.76.0" {
+    try std.testing.expect(!curlVersionSupportsFailWithBody("curl 7.68.0 (x86_64-pc-linux-gnu) libcurl/7.68.0"));
+}
+
+test "curlVersionSupportsFailWithBody accepts curl 7.76.0 and newer" {
+    try std.testing.expect(curlVersionSupportsFailWithBody("curl 7.76.0 (x86_64-pc-linux-gnu) libcurl/7.76.0"));
+    try std.testing.expect(curlVersionSupportsFailWithBody("curl 8.17.0 (x86_64-alpine-linux-musl) libcurl/8.17.0"));
+}
+
+test "curlVersionSupportsFailWithBody tolerates suffixes in version token" {
+    try std.testing.expect(curlVersionSupportsFailWithBody("curl 8.17.0-DEV (x86_64) libcurl/8.17.0"));
 }
 
 test "parseSseLine empty line" {
