@@ -801,7 +801,7 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     };
 
     // Scaffold workspace files
-    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{}, null);
+    try scaffoldWorkspaceForConfig(allocator, &cfg, &ProjectContext{});
 
     // Save config so subsequent commands can find it
     try cfg.save();
@@ -1845,7 +1845,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
 
     // Scaffold workspace files
-    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{}, null);
+    try scaffoldWorkspaceForConfig(allocator, &cfg, &ProjectContext{});
 
     // Save config
     try cfg.save();
@@ -2018,6 +2018,33 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
 /// Create essential workspace files if they don't already exist.
 /// When a `bootstrap_provider` is supplied and the backend does not use
 /// files, documents are written through the provider instead of to disk.
+pub fn scaffoldWorkspaceForConfig(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    ctx: *const ProjectContext,
+) !void {
+    var scaffold_mem_rt: ?memory_root.MemoryRuntime = null;
+    defer if (scaffold_mem_rt) |*rt| rt.deinit();
+
+    const needs_bootstrap_runtime = !bootstrap_mod.backendUsesFiles(cfg.memory.backend) and
+        !std.mem.eql(u8, cfg.memory.backend, "none") and
+        !std.mem.eql(u8, cfg.memory.backend, "memory");
+    if (needs_bootstrap_runtime) {
+        scaffold_mem_rt = memory_root.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
+    }
+
+    const scaffold_mem: ?memory_root.Memory = if (scaffold_mem_rt) |rt| rt.memory else null;
+    const bootstrap_provider = bootstrap_mod.createProvider(
+        allocator,
+        cfg.memory.backend,
+        scaffold_mem,
+        cfg.workspace_dir,
+    ) catch null;
+    defer if (bootstrap_provider) |bp| bp.deinit();
+
+    try scaffoldWorkspace(allocator, cfg.workspace_dir, ctx, bootstrap_provider);
+}
+
 pub fn scaffoldWorkspace(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
@@ -3017,6 +3044,52 @@ test "scaffoldWorkspace handles trailing native separator on Windows paths" {
 
     const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
     bootstrap_file.close();
+}
+
+test "scaffoldWorkspaceForConfig stores sqlite bootstrap docs outside workspace files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = try allocator.dupe(u8, base),
+        .config_path = try std.fs.path.join(allocator, &.{ base, "config.json" }),
+        .allocator = allocator,
+    };
+    cfg.memory.backend = "sqlite";
+
+    try scaffoldWorkspaceForConfig(std.testing.allocator, &cfg, &ProjectContext{});
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("AGENTS.md", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+
+    var mem_rt = memory_root.initRuntime(std.testing.allocator, &cfg.memory, cfg.workspace_dir) orelse
+        return error.TestUnexpectedResult;
+    defer mem_rt.deinit();
+
+    const bootstrap_provider = try bootstrap_mod.createProvider(
+        std.testing.allocator,
+        cfg.memory.backend,
+        mem_rt.memory,
+        cfg.workspace_dir,
+    );
+    defer bootstrap_provider.deinit();
+
+    const agents_content = try bootstrap_provider.load(std.testing.allocator, "AGENTS.md") orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(agents_content);
+    try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
+
+    const bootstrap_content = try bootstrap_provider.load(std.testing.allocator, "BOOTSTRAP.md") orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(bootstrap_content);
+    try std.testing.expect(std.mem.indexOf(u8, bootstrap_content, "BOOTSTRAP.md - Hello, World") != null);
 }
 
 // ── Additional onboard tests ────────────────────────────────────
