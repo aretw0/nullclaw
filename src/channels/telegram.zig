@@ -1911,7 +1911,6 @@ pub const TelegramChannel = struct {
     fn buildAttachmentMetadataFallbackContent(
         allocator: std.mem.Allocator,
         kind: []const u8,
-        file_id: []const u8,
         file_name: ?[]const u8,
         mime_type: ?[]const u8,
         file_size: ?i64,
@@ -1921,8 +1920,7 @@ pub const TelegramChannel = struct {
         var result: std.ArrayListUnmanaged(u8) = .empty;
         const writer = result.writer(allocator);
 
-        writer.print("[ATTACHMENT:{s}", .{kind}) catch return null;
-        writer.print(" file_id={s}", .{file_id}) catch {
+        writer.print("[ATTACHMENT:{s}", .{kind}) catch {
             result.deinit(allocator);
             return null;
         };
@@ -1997,7 +1995,6 @@ pub const TelegramChannel = struct {
                 .voice => "voice",
                 .audio => "audio",
             },
-            info.file_id,
             info.file_name,
             info.mime_type,
             info.file_size,
@@ -2023,7 +2020,6 @@ pub const TelegramChannel = struct {
         return buildAttachmentMetadataFallbackContent(
             allocator,
             "document",
-            doc.file_id,
             doc.file_name,
             doc.mime_type,
             doc.file_size,
@@ -4216,7 +4212,6 @@ test "telegram buildAttachmentMetadataFallbackContent includes available metadat
     const content = TelegramChannel.buildAttachmentMetadataFallbackContent(
         alloc,
         "document",
-        "file-123",
         "report.pdf",
         "application/pdf",
         2048,
@@ -4226,7 +4221,6 @@ test "telegram buildAttachmentMetadataFallbackContent includes available metadat
     defer alloc.free(content);
 
     try std.testing.expect(std.mem.indexOf(u8, content, "[ATTACHMENT:document") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "file_id=file-123") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "file_name=report.pdf") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "mime_type=application/pdf") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "file_size=2048") != null);
@@ -4247,7 +4241,6 @@ test "telegram buildAttachmentMetadataFallbackContent omits optional fields" {
     const content = TelegramChannel.buildAttachmentMetadataFallbackContent(
         alloc,
         "voice",
-        "voice-9",
         null,
         null,
         null,
@@ -4257,11 +4250,40 @@ test "telegram buildAttachmentMetadataFallbackContent omits optional fields" {
     defer alloc.free(content);
 
     try std.testing.expect(std.mem.indexOf(u8, content, "[ATTACHMENT:voice") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "file_id=voice-9") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "duration=6") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "file_name=") == null);
     try std.testing.expect(std.mem.indexOf(u8, content, "mime_type=") == null);
     try std.testing.expect(std.mem.indexOf(u8, content, "file_size=") == null);
+}
+
+fn buildAttachmentMetadataFallbackContentAllocationTest(allocator: std.mem.Allocator) !void {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"caption":"please summarize"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const content = TelegramChannel.buildAttachmentMetadataFallbackContent(
+        allocator,
+        "document",
+        "report.pdf",
+        "application/pdf",
+        2048,
+        null,
+        parsed.value,
+    ) orelse return error.OutOfMemory;
+    defer allocator.free(content);
+}
+
+test "telegram buildAttachmentMetadataFallbackContent frees partial allocations on out-of-memory" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        buildAttachmentMetadataFallbackContentAllocationTest,
+        .{},
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
