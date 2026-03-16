@@ -545,6 +545,7 @@ pub const WebConfig = struct {
     pub const DEFAULT_PATH: []const u8 = "/ws";
     pub const DEFAULT_TRANSPORT: []const u8 = "local";
     pub const DEFAULT_MESSAGE_AUTH_MODE: []const u8 = "pairing";
+    pub const DEFAULT_MAX_HANDSHAKE_SIZE: u16 = 8_192;
     pub const MIN_AUTH_TOKEN_LEN: usize = 16;
     pub const MAX_AUTH_TOKEN_LEN: usize = 128;
     pub const MAX_RELAY_AGENT_ID_LEN: usize = 64;
@@ -563,6 +564,9 @@ pub const WebConfig = struct {
     listen: []const u8 = "127.0.0.1",
     path: []const u8 = DEFAULT_PATH,
     max_connections: u16 = 10,
+    /// Max bytes allowed for the HTTP upgrade request headers during WS handshake.
+    /// Increase this when running behind reverse proxies that append many headers.
+    max_handshake_size: u16 = DEFAULT_MAX_HANDSHAKE_SIZE,
     /// Optional WebSocket-upgrade auth token for browser/extension clients.
     /// Used for WebSocket-upgrade hardening and for `message_auth_mode="token"`.
     /// If null, WebChannel falls back to env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN),
@@ -1408,15 +1412,84 @@ pub const NamedAgentConfig = struct {
 // ── MCP Server Config ──────────────────────────────────────────
 
 pub const McpServerConfig = struct {
+    pub const DEFAULT_TRANSPORT = "stdio";
+    pub const HTTP_TRANSPORT = "http";
+
     name: []const u8,
-    command: []const u8,
+    transport: []const u8 = DEFAULT_TRANSPORT,
+    command: []const u8 = "",
+    url: ?[]const u8 = null,
+    /// Per-request wall clock timeout for HTTP transport. 0 = default.
+    timeout_ms: u32 = 10_000,
     args: []const []const u8 = &.{},
     env: []const McpEnvEntry = &.{},
+    headers: []const McpHeaderEntry = &.{},
 
     pub const McpEnvEntry = struct {
         key: []const u8,
         value: []const u8,
     };
+
+    pub const McpHeaderEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub fn isValidTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, DEFAULT_TRANSPORT) or std.mem.eql(u8, trimmed, HTTP_TRANSPORT);
+    }
+
+    pub fn isHttpTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, HTTP_TRANSPORT);
+    }
+
+    pub fn isValidHttpUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n") != null) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
+
+        const host_comp = uri.host orelse return false;
+        const host = switch (host_comp) {
+            .raw => |h| h,
+            .percent_encoded => |h| blk: {
+                if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
+                break :blk h;
+            },
+        };
+        if (host.len == 0) return false;
+        if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
+        if (host[0] == ':') return false;
+
+        if (host[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+            if (close != host.len - 1) return false;
+        }
+
+        if (std.mem.indexOfScalar(u8, trimmed, '#') != null) return false;
+        if (uri.port) |port| if (port == 0) return false;
+        return true;
+    }
+
+    pub fn isValidHeaderName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        for (trimmed) |ch| {
+            // RFC 7230 token subset; keep strict to prevent header injection.
+            if (ch <= 0x20 or ch >= 0x7f) return false;
+            if (ch == ':' or ch == '"' or ch == '\\') return false;
+        }
+        return true;
+    }
+
+    pub fn isValidHeaderValue(raw: []const u8) bool {
+        if (std.mem.indexOfAny(u8, raw, "\r\n") != null) return false;
+        return true;
+    }
 };
 
 // ── Model Pricing ──────────────────────────────────────────────
@@ -1464,6 +1537,7 @@ test "WebConfig defaults" {
     try std.testing.expectEqualStrings("127.0.0.1", cfg.listen);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, cfg.path);
     try std.testing.expectEqual(@as(u16, 10), cfg.max_connections);
+    try std.testing.expectEqual(WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, cfg.max_handshake_size);
     try std.testing.expect(cfg.auth_token == null);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_MESSAGE_AUTH_MODE, cfg.message_auth_mode);
     try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);
@@ -1493,6 +1567,31 @@ test "security defaults stay least-privilege" {
     try std.testing.expect(http_request.proxy == null);
     try std.testing.expect(http_request.search_base_url == null);
     try std.testing.expectEqualStrings("auto", http_request.search_provider);
+}
+
+test "McpServerConfig transport validation" {
+    try std.testing.expect(McpServerConfig.isValidTransport("stdio"));
+    try std.testing.expect(McpServerConfig.isValidTransport("http"));
+    try std.testing.expect(!McpServerConfig.isValidTransport("sse"));
+}
+
+test "McpServerConfig http url validation" {
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("https://mcp.example.com"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("https://mcp.example.com/mcp"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://mcp.example.com/mcp"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("https://mcp.example.com/mcp#frag"));
+}
+
+test "McpServerConfig timeout defaults" {
+    const cfg = McpServerConfig{ .name = "x", .command = "echo" };
+    try std.testing.expectEqual(@as(u32, 10_000), cfg.timeout_ms);
+}
+
+test "McpServerConfig header validation" {
+    try std.testing.expect(McpServerConfig.isValidHeaderName("Authorization"));
+    try std.testing.expect(!McpServerConfig.isValidHeaderName("Bad Header"));
+    try std.testing.expect(McpServerConfig.isValidHeaderValue("Bearer token"));
+    try std.testing.expect(!McpServerConfig.isValidHeaderValue("line1\nline2"));
 }
 
 test "HttpRequestConfig proxy URL validation" {

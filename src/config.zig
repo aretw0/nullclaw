@@ -513,15 +513,36 @@ pub const Config = struct {
     fn writeMcpServersSection(self: *const Config, w: *std.Io.Writer) !void {
         try w.print("  \"mcp_servers\": {{\n", .{});
         for (self.mcp_servers, 0..) |server, i| {
-            try w.print("    {f}: {{\"command\": {f}", .{
-                std.json.fmt(server.name, .{}),
-                std.json.fmt(server.command, .{}),
-            });
+            try w.print("    {f}: {{", .{std.json.fmt(server.name, .{})});
+
+            var wrote_field = false;
+            if (!std.mem.eql(u8, server.transport, McpServerConfig.DEFAULT_TRANSPORT)) {
+                try w.print("\"transport\": {f}", .{std.json.fmt(server.transport, .{})});
+                wrote_field = true;
+            }
+            if (server.command.len > 0) {
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"command\": {f}", .{std.json.fmt(server.command, .{})});
+                wrote_field = true;
+            }
+            if (server.url) |url| {
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"url\": {f}", .{std.json.fmt(url, .{})});
+                wrote_field = true;
+            }
+            if (server.timeout_ms != 10_000) {
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"timeout_ms\": {d}", .{server.timeout_ms});
+                wrote_field = true;
+            }
             if (server.args.len > 0) {
-                try w.print(", \"args\": {f}", .{std.json.fmt(server.args, .{})});
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"args\": {f}", .{std.json.fmt(server.args, .{})});
+                wrote_field = true;
             }
             if (server.env.len > 0) {
-                try w.print(", \"env\": {{", .{});
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"env\": {{", .{});
                 for (server.env, 0..) |entry, env_i| {
                     if (env_i > 0) try w.print(", ", .{});
                     try w.print("{f}: {f}", .{
@@ -530,6 +551,20 @@ pub const Config = struct {
                     });
                 }
                 try w.print("}}", .{});
+                wrote_field = true;
+            }
+            if (server.headers.len > 0) {
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"headers\": {{", .{});
+                for (server.headers, 0..) |entry, hdr_i| {
+                    if (hdr_i > 0) try w.print(", ", .{});
+                    try w.print("{f}: {f}", .{
+                        std.json.fmt(entry.key, .{}),
+                        std.json.fmt(entry.value, .{}),
+                    });
+                }
+                try w.print("}}", .{});
+                wrote_field = true;
             }
             try w.print("}}", .{});
             if (i + 1 < self.mcp_servers.len) try w.print(",", .{});
@@ -894,6 +929,12 @@ pub const Config = struct {
         InvalidHttpSearchBaseUrl,
         InvalidHttpSearchProvider,
         InvalidHttpSearchFallbackProvider,
+        InvalidMcpTransport,
+        MissingMcpCommand,
+        MissingMcpHttpUrl,
+        InvalidMcpHttpUrl,
+        InvalidMcpHeader,
+        InvalidMcpTimeoutMs,
         InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
@@ -906,6 +947,7 @@ pub const Config = struct {
         InvalidWebRelayPairingCodeTtl,
         InvalidWebRelayUiTokenTtl,
         InvalidWebRelayTokenTtl,
+        InsecurePlaintextSecrets,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -926,6 +968,9 @@ pub const Config = struct {
         }
         if (self.gateway.port == 0) {
             return ValidationError.InvalidPort;
+        }
+        if (!self.secrets.encrypt) {
+            return ValidationError.InsecurePlaintextSecrets;
         }
         if (self.reliability.provider_retries > 100) {
             return ValidationError.InvalidRetryCount;
@@ -954,6 +999,31 @@ pub const Config = struct {
         for (self.http_request.search_fallback_providers) |provider| {
             if (!config_types.HttpRequestConfig.isValidSearchFallbackProviderName(provider)) {
                 return ValidationError.InvalidHttpSearchFallbackProvider;
+            }
+        }
+        for (self.mcp_servers) |mcp_cfg| {
+            if (!config_types.McpServerConfig.isValidTransport(mcp_cfg.transport)) {
+                return ValidationError.InvalidMcpTransport;
+            }
+            if (config_types.McpServerConfig.isHttpTransport(mcp_cfg.transport)) {
+                const mcp_url = mcp_cfg.url orelse return ValidationError.MissingMcpHttpUrl;
+                if (!config_types.McpServerConfig.isValidHttpUrl(mcp_url)) {
+                    return ValidationError.InvalidMcpHttpUrl;
+                }
+                if (mcp_cfg.timeout_ms == 0 or mcp_cfg.timeout_ms > 600_000) {
+                    return ValidationError.InvalidMcpTimeoutMs;
+                }
+                for (mcp_cfg.headers) |entry| {
+                    if (!config_types.McpServerConfig.isValidHeaderName(entry.key) or
+                        !config_types.McpServerConfig.isValidHeaderValue(entry.value))
+                    {
+                        return ValidationError.InvalidMcpHeader;
+                    }
+                }
+            } else {
+                if (std.mem.trim(u8, mcp_cfg.command, " \t\r\n").len == 0) {
+                    return ValidationError.MissingMcpCommand;
+                }
             }
         }
         for (self.channels.web) |web_cfg| {
@@ -1028,6 +1098,7 @@ pub const Config = struct {
             ),
             ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
+            ValidationError.InsecurePlaintextSecrets => std.debug.print("Config error: secrets.encrypt=false is not allowed because it stores secrets in plaintext.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
             ValidationError.InvalidHttpProxyUrl => std.debug.print("Config error: http_request.proxy must be a non-empty http://, https://, or socks5:// URL.\n", .{}),
@@ -1035,6 +1106,12 @@ pub const Config = struct {
             ValidationError.InvalidHttpSearchBaseUrl => std.debug.print("Config error: http_request.search_base_url must be https://host[/search] or local http://host[:port][/search] (no query/fragment).\n", .{}),
             ValidationError.InvalidHttpSearchProvider => std.debug.print("Config error: http_request.search_provider must be one of: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina.\n", .{}),
             ValidationError.InvalidHttpSearchFallbackProvider => std.debug.print("Config error: http_request.search_fallback_providers entries must be valid providers and cannot be 'auto'.\n", .{}),
+            ValidationError.InvalidMcpTransport => std.debug.print("Config error: mcp_servers.<name>.transport must be 'stdio' or 'http'.\n", .{}),
+            ValidationError.MissingMcpCommand => std.debug.print("Config error: mcp_servers.<name>.command is required when transport='stdio'.\n", .{}),
+            ValidationError.MissingMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url is required when transport='http'.\n", .{}),
+            ValidationError.InvalidMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url must be an absolute https:// URL.\n", .{}),
+            ValidationError.InvalidMcpHeader => std.debug.print("Config error: mcp_servers.<name>.headers must contain valid HTTP header names/values (no CR/LF).\n", .{}),
+            ValidationError.InvalidMcpTimeoutMs => std.debug.print("Config error: mcp_servers.<name>.timeout_ms must be in [1, 600000].\n", .{}),
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
@@ -1213,6 +1290,17 @@ test "validation passes for defaults" {
         .allocator = std.testing.allocator,
     };
     try cfg.validate();
+}
+
+test "validation rejects plaintext secrets" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/model",
+        .allocator = std.testing.allocator,
+    };
+    cfg.secrets.encrypt = false;
+    try std.testing.expectError(Config.ValidationError.InsecurePlaintextSecrets, cfg.validate());
 }
 
 test "validation rejects null default_model" {
@@ -1763,6 +1851,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("main", loaded.agent_bindings[0].match.account_id.?);
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers.len);
     try std.testing.expectEqualStrings("context7", loaded.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("stdio", loaded.mcp_servers[0].transport);
     try std.testing.expectEqual(@as(usize, 2), loaded.mcp_servers[0].args.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers[0].env.len);
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", loaded.mcp_servers[0].env[0].key);
@@ -1852,6 +1941,7 @@ test "save escapes mcp_servers strings safely" {
 
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers.len);
     try std.testing.expectEqualStrings("ctx\"7", loaded.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("stdio", loaded.mcp_servers[0].transport);
     try std.testing.expectEqualStrings("npx \"@scope/pkg\"\nrun", loaded.mcp_servers[0].command);
     try std.testing.expectEqual(@as(usize, 2), loaded.mcp_servers[0].args.len);
     try std.testing.expectEqualStrings("--path=C:\\tmp\\file", loaded.mcp_servers[0].args[0]);
@@ -2189,6 +2279,105 @@ test "validation rejects unknown web transport mode" {
         },
     };
     try std.testing.expectError(Config.ValidationError.InvalidWebTransport, cfg.validate());
+}
+
+test "validation accepts mcp http transport config" {
+    const headers = [_]McpServerConfig.McpHeaderEntry{
+        .{ .key = "Authorization", .value = "Bearer test-token" },
+    };
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "remote",
+            .transport = "http",
+            .url = "https://mcp.example.com/rpc",
+            .timeout_ms = 5000,
+            .headers = &headers,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .mcp_servers = &mcp_servers,
+    };
+    try cfg.validate();
+}
+
+test "validation rejects mcp http transport without url" {
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "remote",
+            .transport = "http",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .mcp_servers = &mcp_servers,
+    };
+    try std.testing.expectError(Config.ValidationError.MissingMcpHttpUrl, cfg.validate());
+}
+
+test "validation rejects mcp stdio transport without command" {
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "local",
+            .transport = "stdio",
+            .command = "",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .mcp_servers = &mcp_servers,
+    };
+    try std.testing.expectError(Config.ValidationError.MissingMcpCommand, cfg.validate());
+}
+
+test "validation rejects mcp http transport with malformed header" {
+    const headers = [_]McpServerConfig.McpHeaderEntry{
+        .{ .key = "Authorization", .value = "line1\nline2" },
+    };
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "remote",
+            .transport = "http",
+            .url = "https://mcp.example.com/rpc",
+            .headers = &headers,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .mcp_servers = &mcp_servers,
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidMcpHeader, cfg.validate());
+}
+
+test "validation rejects mcp http transport with invalid timeout_ms" {
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "remote",
+            .transport = "http",
+            .url = "https://mcp.example.com/rpc",
+            .timeout_ms = 0,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .mcp_servers = &mcp_servers,
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidMcpTimeoutMs, cfg.validate());
 }
 
 test "validation rejects unsupported web message_auth_mode value" {
@@ -3331,12 +3520,14 @@ test "json parse mcp_servers" {
     for (cfg.mcp_servers) |s| {
         if (std.mem.eql(u8, s.name, "filesystem")) {
             found_fs = true;
+            try std.testing.expectEqualStrings("stdio", s.transport);
             try std.testing.expectEqualStrings("npx", s.command);
             try std.testing.expectEqual(@as(usize, 3), s.args.len);
             try std.testing.expectEqualStrings("-y", s.args[0]);
         }
         if (std.mem.eql(u8, s.name, "git")) {
             found_git = true;
+            try std.testing.expectEqualStrings("stdio", s.transport);
             try std.testing.expectEqualStrings("mcp-server-git", s.command);
             try std.testing.expectEqual(@as(usize, 0), s.args.len);
         }
@@ -3346,9 +3537,16 @@ test "json parse mcp_servers" {
     // Cleanup
     for (cfg.mcp_servers) |s| {
         allocator.free(s.name);
+        allocator.free(s.transport);
         allocator.free(s.command);
+        if (s.url) |u| allocator.free(u);
         for (s.args) |a| allocator.free(a);
         allocator.free(s.args);
+        for (s.headers) |h| {
+            allocator.free(h.key);
+            allocator.free(h.value);
+        }
+        allocator.free(s.headers);
     }
     allocator.free(cfg.mcp_servers);
 }
@@ -3389,7 +3587,9 @@ test "json parse mcp_servers with env" {
     try std.testing.expect(found_debug);
     // Cleanup
     allocator.free(s.name);
+    allocator.free(s.transport);
     allocator.free(s.command);
+    if (s.url) |u| allocator.free(u);
     for (s.args) |a| allocator.free(a);
     allocator.free(s.args);
     for (s.env) |e| {
@@ -3397,6 +3597,98 @@ test "json parse mcp_servers with env" {
         allocator.free(e.value);
     }
     allocator.free(s.env);
+    for (s.headers) |h| {
+        allocator.free(h.key);
+        allocator.free(h.value);
+    }
+    allocator.free(s.headers);
+    allocator.free(cfg.mcp_servers);
+}
+
+test "json parse mcp_servers http transport" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"mcp_servers": {
+        \\  "remote": {
+        \\    "transport": "http",
+        \\    "url": "https://mcp.example.com/rpc",
+        \\    "timeout_ms": 2500,
+        \\    "headers": {"Authorization": "Bearer test-token"}
+        \\  }
+        \\}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    const s = cfg.mcp_servers[0];
+    try std.testing.expectEqualStrings("remote", s.name);
+    try std.testing.expectEqualStrings("http", s.transport);
+    try std.testing.expectEqualStrings("", s.command);
+    try std.testing.expectEqualStrings("https://mcp.example.com/rpc", s.url.?);
+    try std.testing.expectEqual(@as(u32, 2500), s.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), s.headers.len);
+    try std.testing.expectEqualStrings("Authorization", s.headers[0].key);
+    try std.testing.expectEqualStrings("Bearer test-token", s.headers[0].value);
+
+    allocator.free(s.name);
+    allocator.free(s.transport);
+    allocator.free(s.command);
+    if (s.url) |u| allocator.free(u);
+    for (s.args) |a| allocator.free(a);
+    allocator.free(s.args);
+    for (s.env) |e| {
+        allocator.free(e.key);
+        allocator.free(e.value);
+    }
+    allocator.free(s.env);
+    for (s.headers) |h| {
+        allocator.free(h.key);
+        allocator.free(h.value);
+    }
+    allocator.free(s.headers);
+    allocator.free(cfg.mcp_servers);
+}
+
+test "json parse mcp_servers infers http transport from url" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"mcp_servers": {
+        \\  "remote": {
+        \\    "url": "https://mcp.example.com/rpc",
+        \\    "timeout_ms": 2500,
+        \\    "headers": {"Authorization": "Bearer test-token"}
+        \\  }
+        \\}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    const s = cfg.mcp_servers[0];
+    try std.testing.expectEqualStrings("remote", s.name);
+    try std.testing.expectEqualStrings("http", s.transport);
+    try std.testing.expectEqualStrings("", s.command);
+    try std.testing.expectEqualStrings("https://mcp.example.com/rpc", s.url.?);
+    try std.testing.expectEqual(@as(u32, 2500), s.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), s.headers.len);
+    try std.testing.expectEqualStrings("Authorization", s.headers[0].key);
+    try std.testing.expectEqualStrings("Bearer test-token", s.headers[0].value);
+
+    allocator.free(s.name);
+    allocator.free(s.transport);
+    allocator.free(s.command);
+    if (s.url) |u| allocator.free(u);
+    for (s.args) |a| allocator.free(a);
+    allocator.free(s.args);
+    for (s.env) |e| {
+        allocator.free(e.key);
+        allocator.free(e.value);
+    }
+    allocator.free(s.env);
+    for (s.headers) |h| {
+        allocator.free(h.key);
+        allocator.free(h.value);
+    }
+    allocator.free(s.headers);
     allocator.free(cfg.mcp_servers);
 }
 

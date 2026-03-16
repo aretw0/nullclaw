@@ -2,6 +2,8 @@
 
 This directory provides structured English documentation for NullClaw, covering installation, configuration, operations, and development.
 
+Community: [Join Discord](https://discord.gg/Bfmdua22Ud)
+
 If you are new here, use the guided paths below instead of guessing which page to open first.
 
 ## Page Guide
