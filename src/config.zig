@@ -56,6 +56,7 @@ pub const MatrixConfig = config_types.MatrixConfig;
 pub const MaxConfig = config_types.MaxConfig;
 pub const MattermostConfig = config_types.MattermostConfig;
 pub const WhatsAppConfig = config_types.WhatsAppConfig;
+pub const ExternalChannelConfig = config_types.ExternalChannelConfig;
 pub const IrcConfig = config_types.IrcConfig;
 pub const LarkReceiveMode = config_types.LarkReceiveMode;
 pub const LarkConfig = config_types.LarkConfig;
@@ -385,6 +386,55 @@ pub const Config = struct {
         try w.print("\n      }}\n    }}", .{});
     }
 
+    fn writeExternalChannelAccount(self: *const Config, w: *std.Io.Writer, account: ExternalChannelConfig) !void {
+        try w.print("{{\"channel_name\": {f}, \"command\": {f}", .{
+            std.json.fmt(account.channel_name, .{}),
+            std.json.fmt(account.command, .{}),
+        });
+
+        if (account.args.len > 0) {
+            try w.print(", \"args\": {f}", .{std.json.fmt(account.args, .{})});
+        }
+        if (account.env.len > 0) {
+            try w.print(", \"env\": {{", .{});
+            for (account.env, 0..) |entry, index| {
+                if (index > 0) try w.print(", ", .{});
+                try w.print("{f}: {f}", .{
+                    std.json.fmt(entry.key, .{}),
+                    std.json.fmt(entry.value, .{}),
+                });
+            }
+            try w.print("}}", .{});
+        }
+        if (account.timeout_ms != 10_000) {
+            try w.print(", \"timeout_ms\": {d}", .{account.timeout_ms});
+        }
+
+        try w.print(", \"config\": ", .{});
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, account.config_json, .{}) catch {
+            try w.print("{f}", .{std.json.fmt(account.config_json, .{})});
+            try w.print("}}", .{});
+            return;
+        };
+        defer parsed.deinit();
+        try writePrettyJsonInline(self.allocator, w, parsed.value, "");
+        try w.print("}}", .{});
+    }
+
+    fn writeExternalChannelAccounts(self: *const Config, w: *std.Io.Writer, accounts: []const ExternalChannelConfig) !void {
+        try w.print("    \"external\": {{\n      \"accounts\": {{", .{});
+        for (accounts, 0..) |account, index| {
+            if (index == 0) {
+                try w.print("\n", .{});
+            } else {
+                try w.print(",\n", .{});
+            }
+            try w.print("        \"{s}\": ", .{account.account_id});
+            try self.writeExternalChannelAccount(w, account);
+        }
+        try w.print("\n      }}\n    }}", .{});
+    }
+
     fn writeChannelsSection(self: *const Config, w: *std.Io.Writer) !void {
         try w.print("  \"channels\": {{\n", .{});
 
@@ -400,6 +450,14 @@ pub const Config = struct {
             if (comptime std.mem.eql(u8, field.name, "nostr")) continue;
 
             const channel_value = @field(self.channels, field.name);
+            if (comptime std.mem.eql(u8, field.name, "external")) {
+                if (channel_value.len > 0) {
+                    try writeChannelFieldSeparator(w, wrote_any);
+                    try self.writeExternalChannelAccounts(w, channel_value);
+                    wrote_any = true;
+                }
+                continue;
+            }
             switch (@typeInfo(field.type)) {
                 .pointer => |ptr| {
                     if (ptr.size == .slice and channel_value.len > 0) {
@@ -947,6 +1005,9 @@ pub const Config = struct {
         InvalidMcpHttpUrl,
         InvalidMcpHeader,
         InvalidMcpTimeoutMs,
+        InvalidExternalChannelName,
+        MissingExternalChannelCommand,
+        InvalidExternalChannelTimeoutMs,
         InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
@@ -1038,6 +1099,17 @@ pub const Config = struct {
                 }
             }
         }
+        for (self.channels.external) |external_cfg| {
+            if (!config_types.ExternalChannelConfig.isValidChannelName(external_cfg.channel_name)) {
+                return ValidationError.InvalidExternalChannelName;
+            }
+            if (!config_types.ExternalChannelConfig.hasCommand(external_cfg.command)) {
+                return ValidationError.MissingExternalChannelCommand;
+            }
+            if (!config_types.ExternalChannelConfig.isValidTimeoutMs(external_cfg.timeout_ms)) {
+                return ValidationError.InvalidExternalChannelTimeoutMs;
+            }
+        }
         for (self.channels.web) |web_cfg| {
             if (!config_types.WebConfig.isValidTransport(web_cfg.transport)) {
                 return ValidationError.InvalidWebTransport;
@@ -1124,6 +1196,9 @@ pub const Config = struct {
             ValidationError.InvalidMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url must be an absolute https:// URL.\n", .{}),
             ValidationError.InvalidMcpHeader => std.debug.print("Config error: mcp_servers.<name>.headers must contain valid HTTP header names/values (no CR/LF).\n", .{}),
             ValidationError.InvalidMcpTimeoutMs => std.debug.print("Config error: mcp_servers.<name>.timeout_ms must be in [1, 600000].\n", .{}),
+            ValidationError.InvalidExternalChannelName => std.debug.print("Config error: channels.external.accounts.<id>.channel_name must be non-empty and contain only letters, digits, '_', '-', or '.'.\n", .{}),
+            ValidationError.MissingExternalChannelCommand => std.debug.print("Config error: channels.external.accounts.<id>.command is required.\n", .{}),
+            ValidationError.InvalidExternalChannelTimeoutMs => std.debug.print("Config error: channels.external.accounts.<id>.timeout_ms must be in [1, 600000].\n", .{}),
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
@@ -1492,6 +1567,69 @@ test "save roundtrip preserves telegram interactive settings" {
     try std.testing.expectEqual(@as(u64, 321), loaded.channels.telegram[0].interactive.ttl_secs);
     try std.testing.expect(!loaded.channels.telegram[0].interactive.owner_only);
     try std.testing.expect(!loaded.channels.telegram[0].interactive.remove_on_click);
+}
+
+test "save roundtrip preserves external channel config" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    const external_env = [_]ExternalChannelConfig.EnvEntry{
+        .{ .key = "TOKEN", .value = "secret" },
+    };
+    const external_accounts = [_]ExternalChannelConfig{
+        .{
+            .account_id = "main",
+            .channel_name = "whatsapp_web",
+            .command = "nullclaw-plugin-whatsapp-web",
+            .args = &.{"--stdio"},
+            .env = &external_env,
+            .timeout_ms = 2500,
+            .config_json = "{\"bridge_url\":\"http://127.0.0.1:3301\",\"group_policy\":\"allowlist\"}",
+        },
+    };
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.channels.external = &external_accounts;
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"external\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"channel_name\": \"whatsapp_web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"command\": \"nullclaw-plugin-whatsapp-web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"config\": {") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.channels.external.len);
+    const external_cfg = loaded.channels.external[0];
+    try std.testing.expectEqualStrings("main", external_cfg.account_id);
+    try std.testing.expectEqualStrings("whatsapp_web", external_cfg.channel_name);
+    try std.testing.expectEqualStrings("nullclaw-plugin-whatsapp-web", external_cfg.command);
+    try std.testing.expectEqual(@as(u32, 2500), external_cfg.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), external_cfg.env.len);
+    try std.testing.expectEqualStrings("TOKEN", external_cfg.env[0].key);
+    try std.testing.expect(std.mem.indexOf(u8, external_cfg.config_json, "\"group_policy\":\"allowlist\"") != null);
 }
 
 test "save roundtrip preserves diagnostics logging flags" {
@@ -2439,6 +2577,27 @@ test "validation rejects mcp http transport with invalid timeout_ms" {
         .mcp_servers = &mcp_servers,
     };
     try std.testing.expectError(Config.ValidationError.InvalidMcpTimeoutMs, cfg.validate());
+}
+
+test "validation rejects external channel with invalid timeout_ms" {
+    const external_accounts = [_]ExternalChannelConfig{
+        .{
+            .account_id = "main",
+            .channel_name = "whatsapp_web",
+            .command = "nullclaw-plugin-whatsapp-web",
+            .timeout_ms = 0,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .external = &external_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidExternalChannelTimeoutMs, cfg.validate());
 }
 
 test "validation rejects unsupported web message_auth_mode value" {
@@ -4276,6 +4435,66 @@ test "parse mattermost accounts" {
     try std.testing.expectEqual(@as(usize, 1), mm.onchar_prefixes.len);
     try std.testing.expectEqualStrings("!", mm.onchar_prefixes[0]);
     try std.testing.expect(!mm.require_mention);
+}
+
+test "parse external channel accounts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"channels":{"external":{"accounts":{"wa-web":{"channel_name":"whatsapp_web","command":"nullclaw-plugin-whatsapp-web","args":["--stdio"],"env":{"TOKEN":"secret"},"timeout_ms":2500,"config":{"bridge_url":"http://127.0.0.1:3301","allow_from":["*"]}}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.external.len);
+    const external_cfg = cfg.channels.external[0];
+    try std.testing.expectEqualStrings("wa-web", external_cfg.account_id);
+    try std.testing.expectEqualStrings("whatsapp_web", external_cfg.channel_name);
+    try std.testing.expectEqualStrings("nullclaw-plugin-whatsapp-web", external_cfg.command);
+    try std.testing.expectEqual(@as(usize, 1), external_cfg.args.len);
+    try std.testing.expectEqualStrings("--stdio", external_cfg.args[0]);
+    try std.testing.expectEqual(@as(usize, 1), external_cfg.env.len);
+    try std.testing.expectEqualStrings("TOKEN", external_cfg.env[0].key);
+    try std.testing.expectEqualStrings("secret", external_cfg.env[0].value);
+    try std.testing.expectEqual(@as(u32, 2500), external_cfg.timeout_ms);
+    try std.testing.expect(std.mem.indexOf(u8, external_cfg.config_json, "\"bridge_url\":\"http://127.0.0.1:3301\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, external_cfg.config_json, "\"allow_from\":[\"*\"]") != null);
+}
+
+test "parse external channel preserves invalid timeout for validation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"channels":{"external":{"accounts":{"wa-web":{"channel_name":"whatsapp_web","command":"nullclaw-plugin-whatsapp-web","timeout_ms":0}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    cfg.default_model = "test/model";
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.external.len);
+    try std.testing.expectEqual(@as(u32, 0), cfg.channels.external[0].timeout_ms);
+    try std.testing.expectError(Config.ValidationError.InvalidExternalChannelTimeoutMs, cfg.validate());
+}
+
+test "parse external channel rejects timeout with wrong type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"channels":{"external":{"accounts":{"wa-web":{"channel_name":"whatsapp_web","command":"nullclaw-plugin-whatsapp-web","timeout_ms":"slow"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    cfg.default_model = "test/model";
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.external.len);
+    try std.testing.expectEqual(@as(u32, 0), cfg.channels.external[0].timeout_ms);
+    try std.testing.expectError(Config.ValidationError.InvalidExternalChannelTimeoutMs, cfg.validate());
 }
 
 test "parse lark accounts" {

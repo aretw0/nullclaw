@@ -150,6 +150,46 @@ nullclaw onboard --interactive
 - 渠道配置统一在 `channels.<name>` 下。
 - 多账号渠道通常用 `accounts` 包裹。
 
+外部渠道插件示例：
+
+```json
+{
+  "channels": {
+    "external": {
+      "accounts": {
+        "wa-web": {
+          "channel_name": "whatsapp_web",
+          "command": "nullclaw-plugin-whatsapp-web",
+          "args": ["--stdio"],
+          "timeout_ms": 10000,
+          "env": {
+            "PLUGIN_TOKEN": "secret"
+          },
+          "config": {
+            "bridge_url": "http://127.0.0.1:3301",
+            "allow_from": ["*"]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+外部渠道说明：
+
+- `channel_name` 是运行时渠道 id，routing、bindings、session key 和出站分发都会使用它。
+- `command` 和可选的 `args` 会把插件作为子进程启动，并通过 stdio 上的逐行 JSON-RPC 通信。
+- `timeout_ms` 会限制 host 到插件的 RPC 等待时间（`get_manifest`、`start`、`send`、`health`、`stop`）。
+- `env` 只会传给插件进程本身。
+- `config` 是透传给插件 `start` 请求 `params.config` 的原始 JSON。
+- 插件必须响应 `get_manifest`，处理 `start`、`send`、`stop`；建议实现 `health`，这样 supervision 才能识别“进程活着但 sidecar 已断开”的状态。
+- `get_manifest.result` 至少应包含 `channel_name`；也可以显式声明 `protocol_version: 1` 和 `capabilities.health: true|false`。
+- `inbound_message.params` 至少应包含 `sender_id`、`chat_id`、`content`；如果希望 unknown channel 也能正确做 routing/bindings，建议在 `metadata` 里带上 `peer_kind` 和 `peer_id`。
+- unknown/external channel 也可以提供 `metadata.is_group` 或 `metadata.is_dm`，nullclaw 现在会把这些信息提升到 prompt 的 conversation context。
+- PR #265 的 WhatsApp Web bridge 兼容适配器示例放在 `examples/whatsapp-web/nullclaw-plugin-whatsapp-web`。
+- `nullclaw channel start external` 会启动第一个已配置的外部账号；`nullclaw channel start <channel_name>` 可以直接启动某个具体运行时名字，比如 `whatsapp_web`。
+
 Telegram 示例：
 
 ```json

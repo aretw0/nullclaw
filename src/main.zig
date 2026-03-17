@@ -2249,6 +2249,53 @@ fn canStartFromChannelCommand(channel_id: yc.channel_catalog.ChannelId) bool {
     };
 }
 
+const ResolvedRuntimeChannel = struct {
+    adapter_key: []const u8,
+    start_name: []const u8,
+};
+
+fn resolveConfiguredRuntimeChannel(config: *const yc.config.Config, requested: []const u8) ?ResolvedRuntimeChannel {
+    for (config.channels.external) |external_cfg| {
+        if (std.mem.eql(u8, external_cfg.channel_name, requested)) {
+            return .{
+                .adapter_key = "external",
+                .start_name = external_cfg.channel_name,
+            };
+        }
+    }
+
+    for (config.channels.maixcam) |maixcam_cfg| {
+        if (std.mem.eql(u8, maixcam_cfg.name, requested)) {
+            return .{
+                .adapter_key = "maixcam",
+                .start_name = maixcam_cfg.name,
+            };
+        }
+    }
+
+    return null;
+}
+
+fn printConfiguredRuntimeChannelNames(config: *const yc.config.Config) void {
+    var first = true;
+
+    for (config.channels.external) |external_cfg| {
+        if (external_cfg.channel_name.len == 0) continue;
+        std.debug.print(if (first) "Configured runtime channel names: {s}" else ", {s}", .{external_cfg.channel_name});
+        first = false;
+    }
+
+    for (config.channels.maixcam) |maixcam_cfg| {
+        if (maixcam_cfg.name.len == 0 or std.mem.eql(u8, maixcam_cfg.name, "maixcam")) continue;
+        std.debug.print(if (first) "Configured runtime channel names: {s}" else ", {s}", .{maixcam_cfg.name});
+        first = false;
+    }
+
+    if (!first) {
+        std.debug.print("\n", .{});
+    }
+}
+
 fn printChannelStartSupported() void {
     std.debug.print("Supported:", .{});
     for (yc.channel_catalog.known_channels) |meta| {
@@ -2389,34 +2436,53 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     const requested: ?[]const u8 = if (args.len > 0) args[0] else null;
 
     if (requested) |ch_name| {
-        const meta = yc.channel_catalog.findByKey(ch_name) orelse {
-            std.debug.print("Unknown channel: {s}\n", .{ch_name});
-            printChannelStartSupported();
-            std.process.exit(1);
-        };
-        if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
-            const configured = yc.channel_catalog.configuredCount(&config, meta.id);
-            if (configured > 0) {
-                std.debug.print("Channel {s} is configured ({d} account(s)) but disabled in this build.\n", .{ meta.key, configured });
-            } else {
-                std.debug.print("Channel {s} is disabled in this build.\n", .{meta.key});
+        if (yc.channel_catalog.findByKey(ch_name)) |meta| {
+            if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
+                const configured = yc.channel_catalog.configuredCount(&config, meta.id);
+                if (configured > 0) {
+                    std.debug.print("Channel {s} is configured ({d} account(s)) but disabled in this build.\n", .{ meta.key, configured });
+                } else {
+                    std.debug.print("Channel {s} is disabled in this build.\n", .{meta.key});
+                }
+                std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
+                printChannelStartSupported();
+                std.process.exit(1);
             }
-            std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
-            printChannelStartSupported();
-            std.process.exit(1);
-        }
-        if (!canStartFromChannelCommand(meta.id)) {
-            std.debug.print("Channel {s} cannot be started via `channel start`.\n", .{ch_name});
-            printChannelStartSupported();
-            std.process.exit(1);
-        }
-        if (!yc.channel_catalog.isConfigured(&config, meta.id)) {
-            std.debug.print("{s} channel is not configured.\n", .{meta.label});
-            std.process.exit(1);
+            if (!canStartFromChannelCommand(meta.id)) {
+                std.debug.print("Channel {s} cannot be started via `channel start`.\n", .{ch_name});
+                printChannelStartSupported();
+                std.process.exit(1);
+            }
+            if (!yc.channel_catalog.isConfigured(&config, meta.id)) {
+                std.debug.print("{s} channel is not configured.\n", .{meta.label});
+                std.process.exit(1);
+            }
+
+            const child_args: []const []const u8 = if (args.len > 1) args[1..] else &.{};
+            return dispatchChannelStart(allocator, child_args, &config, meta);
         }
 
-        const child_args: []const []const u8 = if (args.len > 1) args[1..] else &.{};
-        return dispatchChannelStart(allocator, child_args, &config, meta);
+        if (resolveConfiguredRuntimeChannel(&config, ch_name)) |resolved| {
+            const meta = yc.channel_catalog.findByKey(resolved.adapter_key) orelse unreachable;
+            if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
+                std.debug.print("Channel {s} is configured via {s} but disabled in this build.\n", .{ ch_name, meta.key });
+                std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
+                printChannelStartSupported();
+                std.process.exit(1);
+            }
+            if (!canStartFromChannelCommand(meta.id)) {
+                std.debug.print("Channel {s} cannot be started via `channel start`.\n", .{ch_name});
+                printChannelStartSupported();
+                std.process.exit(1);
+            }
+
+            return runGatewayChannel(allocator, &config, resolved.start_name);
+        }
+
+        std.debug.print("Unknown channel: {s}\n", .{ch_name});
+        printChannelStartSupported();
+        printConfiguredRuntimeChannelNames(&config);
+        std.process.exit(1);
     }
 
     // No channel specified -- keep historical preference:
@@ -2452,13 +2518,15 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
 
     // Find and start only the requested channel
     var found = false;
+    var started_name = ch_name;
     for (mgr.channelEntries()) |entry| {
-        if (std.mem.eql(u8, entry.name, ch_name)) {
+        if (std.mem.eql(u8, entry.name, ch_name) or std.mem.eql(u8, entry.adapter_key, ch_name)) {
             entry.channel.start() catch |err| {
-                std.debug.print("{s} channel failed to start: {}\n", .{ ch_name, err });
+                std.debug.print("{s} channel failed to start: {}\n", .{ entry.name, err });
                 std.process.exit(1);
             };
             found = true;
+            started_name = entry.name;
             break;
         }
     }
@@ -2468,7 +2536,7 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
         std.process.exit(1);
     }
 
-    std.debug.print("{s} channel started. Press Ctrl+C to stop.\n", .{ch_name});
+    std.debug.print("{s} channel started. Press Ctrl+C to stop.\n", .{started_name});
 
     // Block until Ctrl+C
     while (!yc.daemon.isShutdownRequested()) {
@@ -3951,6 +4019,51 @@ test "hasConfiguredStartableChannels returns true when telegram configured" {
 
     if (!yc.channel_catalog.isBuildEnabled(.telegram)) return error.SkipZigTest;
     try std.testing.expect(hasConfiguredStartableChannels(&cfg));
+}
+
+test "resolveConfiguredRuntimeChannel matches external plugin name" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .external = &[_]yc.config.ExternalChannelConfig{
+                .{
+                    .account_id = "main",
+                    .channel_name = "whatsapp_web",
+                    .command = "nullclaw-plugin-whatsapp-web",
+                },
+            },
+        },
+    };
+
+    const resolved = resolveConfiguredRuntimeChannel(&cfg, "whatsapp_web") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("external", resolved.adapter_key);
+    try std.testing.expectEqualStrings("whatsapp_web", resolved.start_name);
+}
+
+test "resolveConfiguredRuntimeChannel matches custom maixcam name" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .maixcam = &[_]yc.config.MaixCamConfig{
+                .{
+                    .account_id = "cam-main",
+                    .name = "vision-lab",
+                },
+            },
+        },
+    };
+
+    const resolved = resolveConfiguredRuntimeChannel(&cfg, "vision-lab") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("maixcam", resolved.adapter_key);
+    try std.testing.expectEqualStrings("vision-lab", resolved.start_name);
 }
 
 test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled channel" {

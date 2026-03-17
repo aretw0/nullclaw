@@ -559,6 +559,44 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
     return parsed;
 }
 
+fn buildInboundConversationContext(
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) ?ConversationContext {
+    const inferred_is_group = if (meta.is_group) |value|
+        value
+    else if (meta.is_dm) |value|
+        !value
+    else if (meta.peer_kind) |kind|
+        kind != .direct
+    else if (meta.guild_id != null)
+        true
+    else
+        null;
+
+    const group_id = if (meta.guild_id) |guild_id|
+        guild_id
+    else if (meta.peer_kind != null and meta.peer_id != null and meta.peer_kind.? != .direct)
+        meta.peer_id.?
+    else if (inferred_is_group != null and inferred_is_group.? == true)
+        meta.channel_id orelse msg.chat_id
+    else
+        null;
+
+    const has_sender_identity = meta.sender_username != null or meta.sender_display_name != null;
+    const has_scope = inferred_is_group != null or group_id != null or meta.peer_id != null or meta.guild_id != null or meta.channel_id != null;
+    if (!has_sender_identity and !has_scope) return null;
+
+    return .{
+        .channel = msg.channel,
+        .sender_id = msg.sender_id,
+        .sender_username = meta.sender_username,
+        .sender_display_name = meta.sender_display_name,
+        .group_id = group_id,
+        .is_group = inferred_is_group,
+    };
+}
+
 fn resolveInboundRouteSessionKeyWithMetadata(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -846,19 +884,7 @@ fn inboundDispatcherThread(
             defer channels_mod.max.setInteractiveOwnerContext(null);
         }
 
-        // Build conversation context for channels that provide sender metadata.
-        // Discord passes sender info via metadata JSON; Signal/Telegram do it in channel_loop.
-        const conversation_context: ?ConversationContext = if (std.mem.eql(u8, msg.channel, "discord"))
-            .{
-                .channel = "discord",
-                .sender_id = msg.sender_id,
-                .sender_username = parsed_meta.fields.sender_username,
-                .sender_display_name = parsed_meta.fields.sender_display_name,
-                .group_id = parsed_meta.fields.guild_id,
-                .is_group = if (parsed_meta.fields.is_dm) |dm| !dm else null,
-            }
-        else
-            null;
+        const conversation_context = buildInboundConversationContext(&msg, parsed_meta.fields);
 
         const reply = runtime.session_mgr.processMessageStreaming(
             session_key,
@@ -2006,6 +2032,49 @@ test "parseInboundMetadata extracts discord sender identity fields" {
 
     try std.testing.expectEqualStrings("discord-user", parsed.fields.sender_username.?);
     try std.testing.expectEqualStrings("Discord User", parsed.fields.sender_display_name.?);
+}
+
+test "buildInboundConversationContext preserves discord identity metadata" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "discord",
+        .sender_id = "user-42",
+        .chat_id = "778899",
+        .content = "hello",
+        .session_key = "discord:778899",
+    };
+    const context = buildInboundConversationContext(&msg, .{
+        .guild_id = "guild-1",
+        .is_dm = false,
+        .sender_username = "discord-user",
+        .sender_display_name = "Discord User",
+    }) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("discord", context.channel.?);
+    try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expectEqualStrings("discord-user", context.sender_username.?);
+    try std.testing.expectEqualStrings("Discord User", context.sender_display_name.?);
+    try std.testing.expectEqualStrings("guild-1", context.group_id.?);
+    try std.testing.expect(context.is_group.?);
+}
+
+test "buildInboundConversationContext uses standardized peer metadata for external channels" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "whatsapp_web",
+        .sender_id = "5511",
+        .chat_id = "120363-room",
+        .content = "hello",
+        .session_key = "whatsapp_web:room",
+    };
+    const context = buildInboundConversationContext(&msg, .{
+        .peer_kind = .group,
+        .peer_id = "120363-room",
+        .is_group = true,
+    }) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("whatsapp_web", context.channel.?);
+    try std.testing.expectEqualStrings("5511", context.sender_id.?);
+    try std.testing.expectEqualStrings("120363-room", context.group_id.?);
+    try std.testing.expect(context.is_group.?);
 }
 
 test "makeAssistantReplyOutbound preserves plain replies without choices" {
