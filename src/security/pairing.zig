@@ -721,3 +721,22 @@ test "attemptPair reports disabled when pairing is off" {
     const result = guard.attemptPair("123456");
     try std.testing.expect(result == .disabled);
 }
+
+test "hasPairedTokens false when no tokens" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    try std.testing.expect(!guard.hasPairedTokens());
+}
+
+test "hasPairedTokens true after token added" {
+    const tokens = [_][]const u8{"zc_test_token"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(guard.hasPairedTokens());
+}
+
+test "hasPairedTokens false when pairing disabled and no tokens" {
+    var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
+    defer guard.deinit();
+    try std.testing.expect(!guard.hasPairedTokens());
+}

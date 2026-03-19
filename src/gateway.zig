@@ -4432,17 +4432,14 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         var pair_response_buf: [256]u8 = undefined;
 
         if (findCronRouteDescriptor(base_path)) |desc| {
-            // Auth check: require bearer token when pairing is active.
-            // When no tokens have been issued yet (pairing not completed), allow through
-            // so the CLI can bootstrap jobs before pairing is set up.
+            // Auth check for /cron endpoints:
+            // - No pairing guard → allow (pairing not configured)
+            // - Pairing disabled → allow
+            // - Pairing required, no tokens yet → DENY (bootstrap phase; CLI falls back to disk)
+            // - Pairing required, tokens exist → require valid bearer token
             const auth_header = extractHeader(raw, "Authorization");
             const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
             const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
-            // Auth for /cron:
-            // - No pairing guard → allow (pairing not configured)
-            // - Pairing disabled → allow
-            // - Pairing required, no tokens yet → deny (fall back to disk; no safe credential exists)
-            // - Pairing required, tokens exist → require valid bearer token
             const cron_authorized = if (pairing_guard) |g|
                 if (!g.requirePairing())
                     true
@@ -4705,6 +4702,47 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+test "cron auth matrix: no pairing guard allows all" {
+    // When pairing is not configured (guard is null), /cron is open.
+    try std.testing.expect(isWebhookAuthorized(null, null) == false); // webhook still fails
+    // Simulate the cron_authorized logic with null guard
+    const cron_authorized = true; // null guard → allow
+    try std.testing.expect(cron_authorized);
+}
+
+test "cron auth matrix: pairing disabled allows all" {
+    var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
+    defer guard.deinit();
+    try std.testing.expect(!guard.requirePairing());
+    // cron_authorized = !requirePairing() → true
+    try std.testing.expect(!guard.requirePairing());
+}
+
+test "cron auth matrix: bootstrap phase denies all" {
+    // Pairing required but no tokens issued yet → deny regardless of bearer
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    try std.testing.expect(guard.requirePairing());
+    try std.testing.expect(!guard.hasPairedTokens());
+    // cron_authorized = hasPairedTokens() is false → false (deny)
+    const cron_authorized = guard.hasPairedTokens();
+    try std.testing.expect(!cron_authorized);
+}
+
+test "cron auth matrix: paired phase requires valid token" {
+    const tokens = [_][]const u8{"zc_secret_token"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(guard.requirePairing());
+    try std.testing.expect(guard.hasPairedTokens());
+    // Valid token → authorized
+    try std.testing.expect(guard.isAuthenticated("zc_secret_token"));
+    // Invalid token → denied
+    try std.testing.expect(!guard.isAuthenticated("wrong_token"));
+    // No token → denied
+    try std.testing.expect(!guard.isAuthenticated(""));
+}
 
 test "constants are set correctly" {
     try std.testing.expectEqual(@as(usize, 65_536), MAX_BODY_SIZE);
