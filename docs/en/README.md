@@ -19,6 +19,7 @@ If you are new here, use the guided paths below instead of guessing which page t
 - Start with [Installation](./installation.md) if NullClaw is not running yet
 - Go to [Configuration](./configuration.md) if you already installed it
 - Go to [External Channel Plugins](./external-channels.md) if you are adding a non-core channel
+- Go to [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md) if you operate the built-in DingTalk channel
 - Jump to [Commands](./commands.md) if you want a task-based CLI reference
 
 **If you came from ...**
@@ -46,6 +47,7 @@ Focus on:
 - [Lark Ops Readiness](./ops/lark-ops-readiness.md) for Lark/Feishu websocket and permission incidents
 - [Security](./security.md)
 - [Gateway API](./gateway-api.md)
+- [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md) for DingTalk-specific inbound and reply-path checks
 - [Signal Deployment](../../SIGNAL.md)
 
 ### 3. I want to contribute code or docs
@@ -64,6 +66,7 @@ Focus on:
 - [Configuration](./configuration.md)
 - [External Channel Plugins](./external-channels.md)
 - [Usage and Operations](./usage.md)
+- [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md)
 - [Lark Ops Readiness](./ops/lark-ops-readiness.md)
 - [Architecture](./architecture.md)
 - [Security](./security.md)

@@ -19,6 +19,7 @@
 - 还没跑起来：先看 [安装指南](./installation.md)
 - 已经装好，准备接 provider / memory / channel：看 [配置指南](./configuration.md)
 - 要接入非 core 渠道插件：看 [外部渠道插件](./external-channels.md)
+- 要运维内建 DingTalk 渠道：看 [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)
 - 只想找命令：直接去 [命令参考](./commands.md)
 
 **如果你是从这里跳过来的**
@@ -46,6 +47,7 @@
 - [Lark 运维就绪](./ops/lark-ops-readiness.md)，用于排查飞书/Lark websocket 与权限问题
 - [安全机制](./security.md)
 - [Gateway API](./gateway-api.md)
+- [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md) 适合 DingTalk 入站与回复链路排查
 - [Signal 部署专题](../../SIGNAL.md)
 
 ### 3. 我要开发、改代码、提 PR
@@ -64,6 +66,7 @@
 - [配置指南](./configuration.md)
 - [外部渠道插件](./external-channels.md)
 - [使用与运维](./usage.md)
+- [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)
 - [Lark 运维就绪](./ops/lark-ops-readiness.md)
 - [架构总览](./architecture.md)
 - [安全机制](./security.md)
