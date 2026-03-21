@@ -71,6 +71,33 @@ nullclaw onboard --interactive
 
 ## 核心配置块说明
 
+### `diagnostics`
+
+- 用于控制运行时诊断与可观测性输出。
+- 配置 OpenTelemetry 时，请使用嵌套的 `diagnostics.otel` 对象。
+- OTEL spans 会在回合完成、agent 结束等自然运行边界触发 flush；更长运行流程仍保留批量 flush 作为兜底。
+
+示例：
+
+```json
+{
+  "diagnostics": {
+    "backend": "otel",
+    "log_tool_calls": true,
+    "log_message_receipts": true,
+    "log_message_payloads": true,
+    "log_llm_io": true,
+    "otel": {
+      "endpoint": "http://otel:4318",
+      "service_name": "nullclaw",
+      "headers": {
+        "Authorization": "Bearer example-token"
+      }
+    }
+  }
+}
+```
+
 ### `models.providers`
 
 - 定义各 LLM provider 的连接参数与 API Key。

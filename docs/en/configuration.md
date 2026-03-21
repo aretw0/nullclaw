@@ -86,6 +86,33 @@ The example below is enough to run local CLI mode (replace API key):
 
 ## Core Sections
 
+### `diagnostics`
+
+- Controls runtime diagnostics and observability output.
+- For OpenTelemetry, use the nested `diagnostics.otel` object.
+- OTEL spans are flushed at natural runtime boundaries such as turn completion and agent shutdown, with batch flushing still used as a fallback for longer-running flows.
+
+Example:
+
+```json
+{
+  "diagnostics": {
+    "backend": "otel",
+    "log_tool_calls": true,
+    "log_message_receipts": true,
+    "log_message_payloads": true,
+    "log_llm_io": true,
+    "otel": {
+      "endpoint": "http://otel:4318",
+      "service_name": "nullclaw",
+      "headers": {
+        "Authorization": "Bearer example-token"
+      }
+    }
+  }
+}
+```
+
 ### `models.providers`
 
 - Defines LLM provider connection parameters and API keys.
