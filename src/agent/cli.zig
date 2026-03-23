@@ -355,6 +355,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const start_event = ObserverEvent{ .agent_start = .{
         .provider = if (selected_profile_storage) |profile| profile.provider else cfg.default_provider,
         .model = if (selected_profile_storage) |profile| profile.model else (cfg.default_model orelse "(default)"),
+        .channel = "cli",
     } };
     obs.recordEvent(&start_event);
 

@@ -1569,6 +1569,16 @@ pub const SessionManager = struct {
         }
 
         const turn_input = agent_mod.commands.planTurnInput(content);
+
+        // Record agent start event with channel attribution
+        const start_event = @import("observability.zig").ObserverEvent{ .agent_start = .{
+            .provider = session.agent.provider.getName(),
+            .model = session.agent.model_name,
+            .channel = if (conversation_context) |ctx| ctx.channel else null,
+            .bot_account = if (conversation_context) |ctx| ctx.account_id else null,
+        } };
+        session.agent.observer.recordEvent(&start_event);
+
         const response = try session.agent.turn(content);
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
