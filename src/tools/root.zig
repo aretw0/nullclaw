@@ -281,6 +281,10 @@ pub fn defaultToolsWithPaths(
     et.* = .{ .workspace_dir = workspace_dir, .allowed_paths = allowed_paths };
     try list.append(allocator, et.tool());
 
+    const fa = try allocator.create(file_append.FileAppendTool);
+    fa.* = .{ .workspace_dir = workspace_dir, .allowed_paths = allowed_paths };
+    try list.append(allocator, fa.tool());
+
     return list.toOwnedSlice(allocator);
 }
 
@@ -364,6 +368,14 @@ pub fn allTools(
         .backend_name = opts.backend_name,
     };
     try list.append(allocator, et2.tool());
+
+    const fa = try allocator.create(file_append.FileAppendTool);
+    fa.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+    };
+    try list.append(allocator, fa.tool());
 
     const dt = try allocator.create(file_delete.FileDeleteTool);
     dt.* = .{
@@ -635,6 +647,14 @@ pub fn subagentTools(
     };
     try list.append(allocator, et.tool());
 
+    const fa = try allocator.create(file_append.FileAppendTool);
+    fa.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+    };
+    try list.append(allocator, fa.tool());
+
     const dt = try allocator.create(file_delete.FileDeleteTool);
     dt.* = .{
         .workspace_dir = workspace_dir,
@@ -750,7 +770,7 @@ test "tool result fail" {
     try std.testing.expectEqualStrings("boom", r.error_msg.?);
 }
 
-test "default tools returns four" {
+test "default tools returns five" {
     const tools = try defaultTools(std.testing.allocator, "/tmp/yc_test");
     defer {
         // Free the heap-allocated tool structs
@@ -758,15 +778,17 @@ test "default tools returns four" {
         std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
         std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
         std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
+        std.testing.allocator.destroy(@as(*file_append.FileAppendTool, @ptrCast(@alignCast(tools[4].ptr))));
         std.testing.allocator.free(tools);
     }
-    try std.testing.expectEqual(@as(usize, 4), tools.len);
+    try std.testing.expectEqual(@as(usize, 5), tools.len);
 
     // Verify names
     try std.testing.expectEqualStrings("shell", tools[0].name());
     try std.testing.expectEqualStrings("file_read", tools[1].name());
     try std.testing.expectEqualStrings("file_write", tools[2].name());
     try std.testing.expectEqualStrings("file_edit", tools[3].name());
+    try std.testing.expectEqualStrings("file_append", tools[4].name());
 }
 
 test "all tools has descriptions" {
@@ -776,6 +798,7 @@ test "all tools has descriptions" {
         std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
         std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
         std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
+        std.testing.allocator.destroy(@as(*file_append.FileAppendTool, @ptrCast(@alignCast(tools[4].ptr))));
         std.testing.allocator.free(tools);
     }
     for (tools) |t| {
@@ -790,6 +813,7 @@ test "all tools have parameter schemas" {
         std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
         std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
         std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
+        std.testing.allocator.destroy(@as(*file_append.FileAppendTool, @ptrCast(@alignCast(tools[4].ptr))));
         std.testing.allocator.free(tools);
     }
     for (tools) |t| {
@@ -807,6 +831,7 @@ test "tool spec generation" {
         std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
         std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
         std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
+        std.testing.allocator.destroy(@as(*file_append.FileAppendTool, @ptrCast(@alignCast(tools[4].ptr))));
         std.testing.allocator.free(tools);
     }
     for (tools) |t| {
@@ -824,21 +849,14 @@ test "all tools includes extras when enabled" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    // Order: shell, file_read, file_write, file_edit, file_delete, file_read_hashed, file_edit_hashed, git, image_info,
-    //        memory_store, memory_recall, memory_list, memory_forget,
-    //        delegate, schedule, spawn, pushover, http_request, web_search,
-    //        web_fetch, browser = 21
-    try std.testing.expectEqual(@as(usize, 21), tools.len);
+    try std.testing.expectEqual(@as(usize, 22), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
     defer deinitTools(std.testing.allocator, tools);
 
-    // Order: shell, file_read, file_write, file_edit, file_delete, file_read_hashed, file_edit_hashed, git, image_info,
-    //        memory_store, memory_recall, memory_list, memory_forget,
-    //        delegate, schedule, spawn = 16
-    try std.testing.expectEqual(@as(usize, 16), tools.len);
+    try std.testing.expectEqual(@as(usize, 17), tools.len);
 }
 
 test "all tools wires http and web_search config into tool instances" {
