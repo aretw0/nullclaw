@@ -439,6 +439,23 @@ test "configPrimaryModelForSelection keeps explicit custom url provider ref" {
     try std.testing.expectEqualStrings("custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model", primary);
 }
 
+test "configPrimaryModelForSelection keeps versionless custom url provider ref" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &.{},
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "custom:https://example.com/gpt-4o");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("custom:https://example.com/gpt-4o", primary);
+}
+
 test "bareSessionResetPrompt returns prompt for bare /new" {
     const prompt = bareSessionResetPrompt("/new") orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Execute your Session Startup sequence now") != null);
@@ -943,6 +960,18 @@ test "splitPrimaryModelRef parses custom url model format" {
     const parsed = splitPrimaryModelRef("custom:https://api.example.com/openai/v2/qianfan/custom-model") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("custom:https://api.example.com/openai/v2", parsed.provider);
     try std.testing.expectEqualStrings("qianfan/custom-model", parsed.model);
+}
+
+test "splitPrimaryModelRef parses versionless custom url model format" {
+    const parsed = splitPrimaryModelRef("custom:https://example.com/gpt-4o") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com", parsed.provider);
+    try std.testing.expectEqualStrings("gpt-4o", parsed.model);
+}
+
+test "splitPrimaryModelRef preserves custom url endpoint suffixes" {
+    const parsed = splitPrimaryModelRef("custom:https://my-api.example.com/api/v2/responses/my-model") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://my-api.example.com/api/v2/responses", parsed.provider);
+    try std.testing.expectEqualStrings("my-model", parsed.model);
 }
 
 test "splitPrimaryModelRef rejects malformed values" {
