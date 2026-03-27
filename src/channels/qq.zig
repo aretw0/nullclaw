@@ -463,6 +463,16 @@ pub fn buildSendBody(
     return body_list.toOwnedSlice(allocator);
 }
 
+fn targetWithoutMessageId(buf: []u8, target: []const u8) ?[]const u8 {
+    const msg_type, const id_str, const msg_id = parseTarget(target);
+    if (msg_id == null) return null;
+
+    if (std.mem.eql(u8, msg_type, "c2c") or std.mem.eql(u8, msg_type, "group")) {
+        return std.fmt.bufPrint(buf, "{s}:{s}", .{ msg_type, id_str }) catch null;
+    }
+    return null;
+}
+
 /// Build a media upload body for QQ /files endpoint.
 /// Format: {"file_type":1,"url":"https://...","srv_send_msg":false}
 pub fn buildMediaUploadBody(allocator: std.mem.Allocator, media_url: []const u8) ![]u8 {
@@ -1263,6 +1273,8 @@ pub const QQChannel = struct {
         const msg_type = parsed_target[0];
         const msg_id = parsed_target[2];
         const supports_media_upload = std.mem.eql(u8, msg_type, "group") or std.mem.eql(u8, msg_type, "c2c");
+        var fallback_target_buf: [256]u8 = undefined;
+        const fallback_target = targetWithoutMessageId(&fallback_target_buf, target);
 
         var msg_seq: u32 = 1;
         if (supports_media_upload) {
@@ -1272,7 +1284,14 @@ pub const QQChannel = struct {
             if (parsed.text.len > 0) {
                 var text_it = root.splitMessage(parsed.text, MAX_MESSAGE_LEN);
                 while (text_it.next()) |chunk| {
-                    try self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null);
+                    self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null) catch |err| {
+                        if (err == error.QQApiError and fallback_target != null) {
+                            log.warn("QQ reply send failed; retrying without msg_id target={s}", .{fallback_target.?});
+                            try self.sendChunk(fallback_target.?, chunk, null);
+                        } else {
+                            return err;
+                        }
+                    };
                     if (msg_id != null and msg_seq < std.math.maxInt(u32)) {
                         msg_seq += 1;
                     }
@@ -1280,7 +1299,14 @@ pub const QQChannel = struct {
             }
 
             for (parsed.image_urls) |image_url| {
-                try self.sendMedia(target, image_url, if (msg_id != null) msg_seq else null);
+                self.sendMedia(target, image_url, if (msg_id != null) msg_seq else null) catch |err| {
+                    if (err == error.QQApiError and fallback_target != null) {
+                        log.warn("QQ media reply send failed; retrying without msg_id target={s}", .{fallback_target.?});
+                        try self.sendMedia(fallback_target.?, image_url, null);
+                    } else {
+                        return err;
+                    }
+                };
                 if (msg_id != null and msg_seq < std.math.maxInt(u32)) {
                     msg_seq += 1;
                 }
@@ -1290,7 +1316,14 @@ pub const QQChannel = struct {
 
         var it = root.splitMessage(text, MAX_MESSAGE_LEN);
         while (it.next()) |chunk| {
-            try self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null);
+            self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null) catch |err| {
+                if (err == error.QQApiError and fallback_target != null) {
+                    log.warn("QQ reply send failed; retrying without msg_id target={s}", .{fallback_target.?});
+                    try self.sendChunk(fallback_target.?, chunk, null);
+                } else {
+                    return err;
+                }
+            };
             if (msg_id != null and msg_seq < std.math.maxInt(u32)) msg_seq += 1;
         }
     }
@@ -2673,6 +2706,15 @@ test "qq parseTarget group with msg_id" {
     try std.testing.expectEqualStrings("group", msg_type);
     try std.testing.expectEqualStrings("openid_abc", id);
     try std.testing.expectEqualStrings("msg_def456", mid.?);
+}
+
+// Regression: QQ delayed replies may need to fall back to a plain target without msg_id.
+test "qq targetWithoutMessageId strips reply msg_id for c2c and group" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("c2c:openid_xyz", targetWithoutMessageId(&buf, "c2c:openid_xyz:msg_abc123").?);
+    try std.testing.expectEqualStrings("group:openid_abc", targetWithoutMessageId(&buf, "group:openid_abc:msg_def456").?);
+    try std.testing.expect(targetWithoutMessageId(&buf, "channel:abc:def") == null);
+    try std.testing.expect(targetWithoutMessageId(&buf, "c2c:openid_xyz") == null);
 }
 
 test "qq sendChunk rejects unsupported target type" {
