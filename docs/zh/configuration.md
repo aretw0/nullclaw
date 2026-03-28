@@ -357,9 +357,9 @@ nullclaw onboard --interactive
 - `config` 必须是 JSON object；它会原样透传给插件 `start` 请求里的 `params.config`。
 - 插件必须响应 `get_manifest`，处理 `start`、`send`、`stop`；建议实现 `health`，这样 supervision 才能识别“进程活着但 sidecar 已断开”的状态。
 - `get_manifest.result` 现在必须显式声明 `protocol_version: 2`；`capabilities.health`、`capabilities.streaming`、`capabilities.send_rich`、`capabilities.typing`、`capabilities.edit`、`capabilities.delete`、`capabilities.reactions`、`capabilities.read_receipts` 都是可选能力标记。
-- `health.result` 必须返回显式布尔值（`healthy`）或显式健康信号（`ok`、`connected`、`logged_in`）；空对象会被视为无效响应。
+- `health.result` 必须返回显式布尔值（`healthy`）或显式健康信号（`ok`、`connected`、`logged_in`）；空对象会被视为无效响应。对于需要扫码或设备绑定的渠道，后台认证尚未完成时，应在这里报告 `connected: false` 或 `logged_in: false`。
 - `start.params` 现在包含嵌套的 `runtime` 对象，里面有 `name`、`account_id` 和 host 提供的 `state_dir`。
-- `start.result` 必须返回 `started: true`；`send`、`send_rich`、`edit_message`、`delete_message` 以及其他 typing/message-action RPC 在真正接受动作时都必须返回 `result.accepted: true`。仅仅没有 JSON-RPC `error` 已经不够了。
+- `start.result` 必须返回 `started: true`；`start` 应在完成本地初始化后尽快返回，而不是阻塞等待扫码或人工登录。`send`、`send_rich`、`edit_message`、`delete_message` 以及其他 typing/message-action RPC 在真正接受动作时都必须返回 `result.accepted: true`。仅仅没有 JSON-RPC `error` 已经不够了。
 - `send.params` 现在也拆成嵌套的 `runtime` 和 `message` 对象；文本字段统一使用 `message.text`。
 - 如果插件同时声明了 `capabilities.edit=true` 和 `capabilities.delete=true`，那么 `send.result` 还可以返回 `message_id`，或者返回 `message { target?, message_id }`；这样 nullclaw 就能在不支持原生 `.chunk` 流式发送的渠道上维护一条可编辑的草稿消息。
 - 如果 `capabilities.streaming=true`，nullclaw 可能在模型流式输出时发送 `.chunk` 阶段的 `send` 事件；如果缺省或为 `false`，只会发送最终结果。
