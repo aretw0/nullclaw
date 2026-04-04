@@ -2302,6 +2302,8 @@ test "save roundtrip preserves extended config sections" {
     cfg.gateway.pair_rate_limit_per_minute = 20;
     cfg.gateway.webhook_rate_limit_per_minute = 80;
     cfg.gateway.idempotency_ttl_secs = 120;
+    cfg.gateway.max_body_size_bytes = 2 * 1024 * 1024;
+    cfg.gateway.request_timeout_secs = 45;
     cfg.gateway.paired_tokens = &.{ "tok-1", "tok-2" };
 
     cfg.tunnel.provider = "ngrok";
@@ -2411,6 +2413,8 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expect(loaded.memory.response_cache.enabled);
     try std.testing.expectEqual(@as(u32, 2), loaded.gateway.paired_tokens.len);
     try std.testing.expect(loaded.gateway.allow_public_bind);
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), loaded.gateway.max_body_size_bytes);
+    try std.testing.expectEqual(@as(u64, 45), loaded.gateway.request_timeout_secs);
     try std.testing.expectEqualStrings("ngrok", loaded.tunnel.provider);
     try std.testing.expect(loaded.tunnel.ngrok != null);
     try std.testing.expectEqualStrings("ngrok-test-token", loaded.tunnel.ngrok.?.auth_token.?);
@@ -3567,6 +3571,17 @@ test "json parse gateway paired tokens" {
     try std.testing.expectEqualStrings("token-3", cfg.gateway.paired_tokens[2]);
     for (cfg.gateway.paired_tokens) |t| allocator.free(t);
     allocator.free(cfg.gateway.paired_tokens);
+}
+
+test "json parse gateway configurable limits" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"gateway": {"max_body_size_bytes": 20971520, "request_timeout_secs": 120}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 20 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
+    try std.testing.expectEqual(@as(u64, 120), cfg.gateway.request_timeout_secs);
 }
 
 test "json parse browser allowed domains" {

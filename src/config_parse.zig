@@ -1901,7 +1901,13 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (v == .array) self.gateway.paired_tokens = try parseStringArray(self.allocator, v.array);
             }
             if (gw.object.get("max_body_size_bytes")) |v| {
-                if (v == .integer) self.gateway.max_body_size_bytes = @intCast(v.integer);
+                if (v == .integer and v.integer >= 0) {
+                    const raw: u64 = @intCast(v.integer);
+                    self.gateway.max_body_size_bytes = @intCast(@min(raw, @as(u64, std.math.maxInt(usize))));
+                }
+            }
+            if (gw.object.get("request_timeout_secs")) |v| {
+                if (v == .integer and v.integer >= 0) self.gateway.request_timeout_secs = @intCast(v.integer);
             }
         }
     }

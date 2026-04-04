@@ -1314,6 +1314,9 @@ pub const GatewayConfig = struct {
     /// Default 65536 (64 KB). Raise this when the gateway is configured
     /// for multi-modal use and needs to accept image payloads.
     max_body_size_bytes: usize = 65_536,
+    /// Socket read timeout for incoming HTTP requests.
+    /// Default 30 seconds. Raise this for large payloads on slow links.
+    request_timeout_secs: u64 = 30,
 };
 
 // ── A2A (Agent-to-Agent) protocol config ────────────────────────

@@ -3,8 +3,8 @@
 //! Mirrors ZeroClaw's axum-based gateway with:
 //!   - Sliding-window rate limiting (per-IP)
 //!   - Idempotency store (deduplicates webhook requests)
-//!   - Body size limits (64KB max)
-//!   - Request timeouts (30s)
+//!   - Body size limits (configurable, default 64KB)
+//!   - Request timeouts (configurable, default 30s)
 //!   - Bearer token authentication (PairingGuard)
 //!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
@@ -43,7 +43,6 @@ const buildConversationContext = @import("agent/prompt.zig").buildConversationCo
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
 const MAX_HEADER_SIZE: usize = 8_192;
-const MAX_HTTP_REQUEST_SIZE: usize = MAX_HEADER_SIZE + MAX_BODY_SIZE;
 
 /// Request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -2135,6 +2134,17 @@ fn headerEndOffset(raw: []const u8) ?usize {
     return pos + separator.len;
 }
 
+fn maxHttpRequestSize(max_body: usize) usize {
+    return std.math.add(usize, MAX_HEADER_SIZE, max_body) catch std.math.maxInt(usize);
+}
+
+fn effectiveRequestReadTimeoutSecs(config_opt: ?*const Config) u64 {
+    if (config_opt) |cfg| {
+        if (cfg.gateway.request_timeout_secs > 0) return cfg.gateway.request_timeout_secs;
+    }
+    return REQUEST_TIMEOUT_SECS;
+}
+
 fn expectedHttpRequestSize(raw: []const u8, max_body: usize) !?usize {
     const header_end = headerEndOffset(raw) orelse {
         if (raw.len > MAX_HEADER_SIZE) return error.RequestTooLarge;
@@ -2150,16 +2160,19 @@ fn expectedHttpRequestSize(raw: []const u8, max_body: usize) !?usize {
     const content_length = std.fmt.parseInt(usize, trimmed, 10) catch return error.InvalidContentLength;
     if (content_length > max_body) return error.RequestTooLarge;
 
+    const max_request_size = maxHttpRequestSize(max_body);
     const total = std.math.add(usize, header_end, content_length) catch return error.RequestTooLarge;
-    if (total > MAX_HEADER_SIZE + max_body) return error.RequestTooLarge;
+    if (total > max_request_size) return error.RequestTooLarge;
     return total;
 }
 
-fn configureRequestReadTimeout(stream: *std.net.Stream) void {
+fn configureRequestReadTimeout(stream: *std.net.Stream, timeout_secs: u64) void {
     if (!@hasDecl(std.posix.SO, "RCVTIMEO")) return;
 
+    const zero_timeout = std.posix.timeval{ .sec = 0, .usec = 0 };
+    const TimevalSecs = @TypeOf(zero_timeout.sec);
     const timeout = std.posix.timeval{
-        .sec = @intCast(REQUEST_TIMEOUT_SECS),
+        .sec = @intCast(@min(timeout_secs, @as(u64, std.math.maxInt(TimevalSecs)))),
         .usec = 0,
     };
     std.posix.setsockopt(
@@ -2175,6 +2188,7 @@ fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype, max_
     errdefer request_buf.deinit(allocator);
 
     var expected_total: ?usize = null;
+    const max_request_size = maxHttpRequestSize(max_body);
     var chunk: [2048]u8 = undefined;
 
     while (true) {
@@ -2185,7 +2199,7 @@ fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype, max_
         if (n == 0) return error.IncompleteRequest;
 
         try request_buf.appendSlice(allocator, chunk[0..n]);
-        if (request_buf.items.len > MAX_HEADER_SIZE + max_body) return error.RequestTooLarge;
+        if (request_buf.items.len > max_request_size) return error.RequestTooLarge;
 
         if (expected_total == null) {
             expected_total = try expectedHttpRequestSize(request_buf.items, max_body);
@@ -4911,6 +4925,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
     }
     defer if (owned_config) |*c| c.deinit();
+    const max_body = if (config_opt) |cfg| cfg.gateway.max_body_size_bytes else MAX_BODY_SIZE;
+    const request_timeout_secs = effectiveRequestReadTimeoutSecs(config_opt);
 
     // Provider runtime bundle (primary + reliability wrapper) must outlive the accept loop.
     var provider_bundle_opt: ?providers.runtime_bundle.RuntimeProviderBundle = null;
@@ -5150,7 +5166,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         };
         var close_conn = true;
         defer if (close_conn) conn.stream.close();
-        configureRequestReadTimeout(&conn.stream);
+        configureRequestReadTimeout(&conn.stream, request_timeout_secs);
 
         // Per-request arena — all request-scoped allocations freed in one shot
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -5158,7 +5174,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         const req_allocator = arena.allocator();
 
         // Read full HTTP request (headers + optional body).
-        const max_body = if (config_opt) |c| c.gateway.max_body_size_bytes else MAX_BODY_SIZE;
         const raw = readHttpRequest(req_allocator, &conn.stream, max_body) catch |err| {
             switch (err) {
                 error.RequestTooLarge => writeJsonResponse(&conn.stream, "413 Payload Too Large", "{\"error\":\"request too large\"}"),
@@ -5999,12 +6014,30 @@ test "MAX_BODY_SIZE is 64KB (default)" {
     try std.testing.expectEqual(@as(usize, 64 * 1024), MAX_BODY_SIZE);
 }
 
+test "maxHttpRequestSize saturates on overflow" {
+    try std.testing.expectEqual(std.math.maxInt(usize), maxHttpRequestSize(std.math.maxInt(usize)));
+}
+
 test "RATE_LIMIT_WINDOW_SECS is 60" {
     try std.testing.expectEqual(@as(u64, 60), RATE_LIMIT_WINDOW_SECS);
 }
 
 test "REQUEST_TIMEOUT_SECS is 30" {
     try std.testing.expectEqual(@as(u64, 30), REQUEST_TIMEOUT_SECS);
+}
+
+test "effectiveRequestReadTimeoutSecs uses configured value and defaults zero to 30" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    cfg.gateway.request_timeout_secs = 45;
+    try std.testing.expectEqual(@as(u64, 45), effectiveRequestReadTimeoutSecs(&cfg));
+
+    cfg.gateway.request_timeout_secs = 0;
+    try std.testing.expectEqual(@as(u64, REQUEST_TIMEOUT_SECS), effectiveRequestReadTimeoutSecs(&cfg));
 }
 
 test "rate limiter different keys do not interfere" {
