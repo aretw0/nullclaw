@@ -486,12 +486,25 @@ test "run timeout kills Windows shell descendants" {
     const pid_path = try std.fs.path.join(allocator, &.{ tmp_path, "child.pid" });
     defer allocator.free(pid_path);
     try tmp_dir.dir.writeFile(.{
+        .sub_path = "child.ps1",
+        // Regression: invoking PowerShell through `-Command ... -- arg` is not
+        // reliable on GitHub's Windows runner and can let cmd.exe exit before
+        // the timeout watchdog fires. Keep the payload in a script file so the
+        // wrapper deterministically stays alive until the watchdog kills it.
+        .data =
+        \\param([string]$PidPath)
+        \\$PID | Set-Content -NoNewline -LiteralPath $PidPath
+        \\Start-Sleep -Seconds 8
+        \\
+        ,
+    });
+    try tmp_dir.dir.writeFile(.{
         .sub_path = "wrapper.cmd",
-        // Keep the PowerShell payload in a temporary batch file so the test
-        // exercises cmd.exe descendant cleanup without brittle nested quoting.
+        // Keep cmd.exe in front so the test still exercises descendant cleanup
+        // instead of timing out a direct PowerShell child.
         .data =
         \\@echo off
-        \\powershell.exe -NoProfile -Command "$PID | Set-Content -NoNewline -LiteralPath $args[0]; Start-Sleep -Seconds 8" -- "%~dp0child.pid"
+        \\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0child.ps1" "%~dp0child.pid"
         \\
         ,
     });
@@ -505,11 +518,23 @@ test "run timeout kills Windows shell descendants" {
 
     try std.testing.expect(result.timed_out);
 
-    const pid_bytes = try std.fs.cwd().readFileAlloc(allocator, pid_path, 32);
-    defer allocator.free(pid_bytes);
+    var pid_bytes: ?[]u8 = null;
+    var read_attempt: usize = 0;
+    while (read_attempt < 20) : (read_attempt += 1) {
+        pid_bytes = std.fs.cwd().readFileAlloc(allocator, pid_path, 32) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (pid_bytes != null) break;
+    }
+    const pid_bytes_owned = pid_bytes orelse return error.FileNotFound;
+    defer allocator.free(pid_bytes_owned);
     const child_pid = try std.fmt.parseInt(
         std.os.windows.DWORD,
-        std.mem.trim(u8, pid_bytes, " \t\r\n"),
+        std.mem.trim(u8, pid_bytes_owned, " \t\r\n"),
         10,
     );
     defer if (processExistsWindows(child_pid)) terminateWindowsProcessTreeByPid(child_pid);
