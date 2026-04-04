@@ -1956,6 +1956,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (gw.object.get("paired_tokens")) |v| {
                 if (v == .array) self.gateway.paired_tokens = try parseStringArray(self.allocator, v.array);
             }
+            if (gw.object.get("max_body_size_bytes")) |v| {
+                if (v == .integer) self.gateway.max_body_size_bytes = @intCast(v.integer);
+            }
+            if (gw.object.get("request_timeout_secs")) |v| {
+                if (v == .integer) self.gateway.request_timeout_secs = @intCast(v.integer);
+            }
         }
     }
 
@@ -1999,6 +2005,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (a2a.object.get("version")) |v| {
                 if (v == .string) self.a2a.version = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("multi_modal")) |v| {
+                if (v == .bool) self.a2a.multi_modal = v.bool;
             }
         }
     }

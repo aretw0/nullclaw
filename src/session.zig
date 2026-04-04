@@ -217,6 +217,11 @@ pub const SessionManager = struct {
     policy: ?*const SecurityPolicy = null,
     subagent_manager: ?*@import("subagent.zig").SubagentManager = null,
 
+    /// Result of the startup vision probe against the configured model.
+    /// null = not yet confirmed (probe not run, skipped, or inconclusive), true = model accepts images,
+    /// false = model rejected images (ProviderDoesNotSupportVision).
+    vision_capable: ?bool = null,
+
     mutex: std.Thread.Mutex,
     usage_log_mutex: std.Thread.Mutex,
     claim_state_io_mutex: std.Thread.Mutex,
@@ -317,6 +322,82 @@ pub const SessionManager = struct {
         self.claim_attempts.deinit(self.allocator);
 
         if (self.claim_state_path) |path| self.allocator.free(path);
+    }
+
+    /// Probe whether the configured model accepts image input by sending a minimal
+    /// 1×1 white JPEG directly to the provider (no session history, no tools).
+    /// Sets self.vision_capable to true/false accordingly. Errors other than
+    /// ProviderDoesNotSupportVision leave the result unset so callers can fall
+    /// back to explicit configuration. The result is cached once confirmed.
+    pub fn probeVision(self: *SessionManager, allocator: std.mem.Allocator) void {
+        if (self.vision_capable != null) return;
+
+        var owned_probe_model_ref: ?[]u8 = null;
+        defer if (owned_probe_model_ref) |model_ref| allocator.free(model_ref);
+
+        const probe_model_ref = blk: {
+            for (self.config.model_routes) |route| {
+                if (!std.mem.eql(u8, route.hint, "vision")) continue;
+                const route_model_ref = std.fmt.allocPrint(allocator, "{s}/{s}", .{ route.provider, route.model }) catch {
+                    log.info("vision probe: failed to build route model reference, skipping", .{});
+                    return;
+                };
+                owned_probe_model_ref = route_model_ref;
+                break :blk route_model_ref;
+            }
+            break :blk self.config.default_model orelse {
+                log.info("vision probe: no default model configured, skipping", .{});
+                return;
+            };
+        };
+
+        if (!self.provider.supportsVisionForModel(probe_model_ref)) {
+            log.info("vision probe: model '{s}' is already marked as text-only", .{probe_model_ref});
+            self.vision_capable = false;
+            return;
+        }
+
+        // Minimal 1×1 white JPEG (~500 bytes) — sufficient to test vision acceptance
+        // without triggering expensive model compute.
+        const tiny_jpeg_b64 =
+            "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U" ++
+            "HRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgN" ++
+            "DRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy" ++
+            "MjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQ" ++
+            "AAAAAAAAAAAAAAAAAAAP/EABQBAQAAAAAAAAAAAAAAAAAAAAD/xAAUEQEAAAAAAAAAAAAA" ++
+            "AAAAAAAA/9oADAMBAAIRAxEAPwCwABmX/9k=";
+
+        const content_parts = [_]providers.ContentPart{
+            .{ .text = "." },
+            .{ .image_base64 = .{ .data = tiny_jpeg_b64, .media_type = "image/jpeg" } },
+        };
+        const probe_msg = providers.ChatMessage{
+            .role = .user,
+            .content = ".",
+            .content_parts = &content_parts,
+        };
+        const probe_req = providers.ChatRequest{
+            .messages = &[_]providers.ChatMessage{probe_msg},
+            .model = probe_model_ref,
+            .temperature = 0.0,
+            .max_tokens = 1,
+            .timeout_secs = self.config.gateway.request_timeout_secs,
+        };
+
+        log.info("vision probe: querying model '{s}' for image support", .{probe_model_ref});
+        const resp = self.provider.chat(allocator, probe_req, probe_model_ref, 0.0) catch |err| {
+            if (err == error.ProviderDoesNotSupportVision) {
+                log.info("vision probe: model '{s}' does not support vision", .{probe_model_ref});
+                self.vision_capable = false;
+            } else {
+                log.info("vision probe: model '{s}' probe inconclusive ({s}), leaving capability unset", .{ probe_model_ref, @errorName(err) });
+            }
+            return;
+        };
+        if (resp.content) |c| allocator.free(c);
+        if (resp.reasoning_content) |c| allocator.free(c);
+        log.info("vision probe: model '{s}' confirmed vision support", .{probe_model_ref});
+        self.vision_capable = true;
     }
 
     fn detectSubagentManager(tools: []const Tool) ?*@import("subagent.zig").SubagentManager {
@@ -1893,11 +1974,20 @@ const testing = std.testing;
 
 const MockProvider = struct {
     response: []const u8,
+    chat_error: ?anyerror = null,
+    chat_calls: usize = 0,
+    supports_vision: bool = true,
+    vision_model: ?[]const u8 = null,
+    last_chat_model_len: usize = 0,
+    last_chat_model_buf: [128]u8 = undefined,
+    last_request_timeout_secs: u64 = 0,
 
     const vtable = Provider.VTable{
         .chatWithSystem = mockChatWithSystem,
         .chat = mockChat,
         .supportsNativeTools = mockSupportsNativeTools,
+        .supports_vision = mockSupportsVision,
+        .supports_vision_for_model = mockSupportsVisionForModel,
         .getName = mockGetName,
         .deinit = mockDeinit,
     };
@@ -1921,16 +2011,38 @@ const MockProvider = struct {
     fn mockChat(
         ptr: *anyopaque,
         allocator: Allocator,
-        _: providers.ChatRequest,
+        request: providers.ChatRequest,
         _: []const u8,
         _: f64,
     ) anyerror!providers.ChatResponse {
         const self: *MockProvider = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+        self.last_chat_model_len = @min(request.model.len, self.last_chat_model_buf.len);
+        @memcpy(self.last_chat_model_buf[0..self.last_chat_model_len], request.model[0..self.last_chat_model_len]);
+        self.last_request_timeout_secs = request.timeout_secs;
+        if (self.chat_error) |err| return err;
         return .{ .content = try allocator.dupe(u8, self.response) };
     }
 
     fn mockSupportsNativeTools(_: *anyopaque) bool {
         return false;
+    }
+
+    fn mockSupportsVision(ptr: *anyopaque) bool {
+        const self: *MockProvider = @ptrCast(@alignCast(ptr));
+        return self.supports_vision;
+    }
+
+    fn mockSupportsVisionForModel(ptr: *anyopaque, model: []const u8) bool {
+        const self: *MockProvider = @ptrCast(@alignCast(ptr));
+        if (self.vision_model) |vision_model| {
+            return std.mem.eql(u8, model, vision_model);
+        }
+        return self.supports_vision;
+    }
+
+    fn lastChatModel(self: *const MockProvider) []const u8 {
+        return self.last_chat_model_buf[0..self.last_chat_model_len];
     }
 
     fn mockGetName(_: *anyopaque) []const u8 {
@@ -2188,6 +2300,75 @@ fn testConfig() Config {
         .default_model = "test/mock-model",
         .allocator = testing.allocator,
     };
+}
+
+test "probeVision caches unsupported result" {
+    var mock = MockProvider{
+        .response = "ok",
+        .chat_error = error.ProviderDoesNotSupportVision,
+        .supports_vision = true,
+    };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+
+    sm.probeVision(testing.allocator);
+    try testing.expectEqual(@as(?bool, false), sm.vision_capable);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
+
+    sm.probeVision(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
+}
+
+test "probeVision leaves capability unset on transient provider failure" {
+    // Regression: inconclusive startup probes must fall back to cfg.a2a.multi_modal.
+    var mock = MockProvider{
+        .response = "ok",
+        .chat_error = error.ProviderError,
+        .supports_vision = true,
+    };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+
+    sm.probeVision(testing.allocator);
+    try testing.expect(sm.vision_capable == null);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
+}
+
+test "probeVision skips network probe when provider already reports no vision support" {
+    var mock = MockProvider{
+        .response = "ok",
+        .supports_vision = false,
+    };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+
+    sm.probeVision(testing.allocator);
+    try testing.expectEqual(@as(?bool, false), sm.vision_capable);
+    try testing.expectEqual(@as(usize, 0), mock.chat_calls);
+}
+
+test "probeVision uses vision route model ref and gateway timeout" {
+    var mock = MockProvider{
+        .response = "ok",
+        .vision_model = "openrouter/openai/gpt-4.1",
+    };
+    var cfg = testConfig();
+    cfg.default_model = "text-only";
+    cfg.gateway.request_timeout_secs = 77;
+    cfg.model_routes = &.{
+        .{
+            .hint = "vision",
+            .provider = "openrouter",
+            .model = "openai/gpt-4.1",
+        },
+    };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+
+    sm.probeVision(testing.allocator);
+    try testing.expectEqual(@as(?bool, true), sm.vision_capable);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
+    try testing.expectEqualStrings("openrouter/openai/gpt-4.1", mock.lastChatModel());
+    try testing.expectEqual(@as(u64, 77), mock.last_request_timeout_secs);
 }
 
 fn testBuildClaimToken(
