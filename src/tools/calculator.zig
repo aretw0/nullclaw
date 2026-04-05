@@ -6,6 +6,10 @@ const JsonObjectMap = root.JsonObjectMap;
 const JsonValue = root.JsonValue;
 
 pub const CalculatorTool = struct {
+    const MAX_EXACT_INTEGER: i64 = 9_007_199_254_740_991;
+    const MAX_FIXED_NOTATION_ABS: f64 = 1_000_000_000_000.0;
+    const MIN_FIXED_NOTATION_ABS: f64 = 0.000001;
+
     pub const tool_name = "calculator";
     pub const tool_description = "Perform mathematical calculations accurately. Supports arithmetic (add, subtract, multiply, divide, pow, sqrt), logarithms (log, ln, exp), rounding (abs, floor, ceil, round), and statistics (average, median, stdev, min, max, count, percentile).";
     pub const tool_params =
@@ -35,7 +39,7 @@ pub const CalculatorTool = struct {
         }
 
         const values = extractValues(allocator, values_arr) catch |err| switch (err) {
-            error.InvalidNumber => {
+            error.InvalidNumber, error.IntegerPrecisionLoss => {
                 return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) };
             },
             else => return err,
@@ -53,19 +57,24 @@ pub const CalculatorTool = struct {
         const values = try allocator.alloc(f64, arr.len);
         errdefer allocator.free(values);
         for (arr, 0..) |item, i| {
-            values[i] = jsonToFloat(item) orelse {
-                return error.InvalidNumber;
-            };
+            values[i] = try jsonToFloat(item);
         }
         return values;
     }
 
-    fn jsonToFloat(val: JsonValue) ?f64 {
+    fn jsonToFloat(val: JsonValue) !f64 {
         return switch (val) {
-            .integer => |i| @floatFromInt(i),
+            .integer => |i| integerToExactFloat(i),
             .float => |f| f,
-            else => null,
+            else => error.InvalidNumber,
         };
+    }
+
+    fn integerToExactFloat(value: i64) !f64 {
+        if (value > MAX_EXACT_INTEGER or value < -MAX_EXACT_INTEGER) {
+            return error.IntegerPrecisionLoss;
+        }
+        return @floatFromInt(value);
     }
 
     fn compute(allocator: std.mem.Allocator, operation: []const u8, values: []f64, args: JsonObjectMap) ![]const u8 {
@@ -221,18 +230,45 @@ pub const CalculatorTool = struct {
     }
 
     fn formatResult(allocator: std.mem.Allocator, value: f64) ![]const u8 {
-        const raw = try std.fmt.allocPrint(allocator, "{d:.6}", .{value});
+        if (!std.math.isFinite(value)) return error.ResultNotFinite;
+
+        const normalized = if (value == 0.0) 0.0 else value;
+        const raw = if (shouldUseScientificNotation(normalized))
+            try std.fmt.allocPrint(allocator, "{e:.6}", .{normalized})
+        else
+            try std.fmt.allocPrint(allocator, "{d:.6}", .{normalized});
         errdefer allocator.free(raw);
 
-        const trimmed = trimFloatStr(raw);
+        const trimmed = try trimFormattedFloat(allocator, raw);
         if (trimmed.len == raw.len) return raw;
 
-        const result = try allocator.dupe(u8, trimmed);
         allocator.free(raw);
-        return result;
+        return trimmed;
     }
 
-    fn trimFloatStr(s: []const u8) []const u8 {
+    fn shouldUseScientificNotation(value: f64) bool {
+        const abs_value = @abs(value);
+        return abs_value >= MAX_FIXED_NOTATION_ABS or (abs_value > 0.0 and abs_value < MIN_FIXED_NOTATION_ABS);
+    }
+
+    fn trimFormattedFloat(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+        const exp_index = std.mem.indexOfScalar(u8, raw, 'e') orelse {
+            const trimmed = trimFixedFloatStr(raw);
+            return if (trimmed.len == raw.len) raw else try allocator.dupe(u8, trimmed);
+        };
+
+        const trimmed_mantissa = trimFixedFloatStr(raw[0..exp_index]);
+        if (trimmed_mantissa.len == exp_index) return raw;
+
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(allocator);
+        try result.ensureTotalCapacity(allocator, trimmed_mantissa.len + raw.len - exp_index);
+        try result.appendSlice(allocator, trimmed_mantissa);
+        try result.appendSlice(allocator, raw[exp_index..]);
+        return result.toOwnedSlice(allocator);
+    }
+
+    fn trimFixedFloatStr(s: []const u8) []const u8 {
         const dot = std.mem.indexOfScalar(u8, s, '.') orelse return s;
         var end = s.len;
         while (end > dot + 1 and s[end - 1] == '0') : (end -= 1) {}
@@ -564,6 +600,18 @@ test "calculator round" {
     try std.testing.expectEqualStrings("4", result.output);
 }
 
+test "calculator round normalizes negative zero" {
+    // Regression: round(-0.4) used to return the confusing string "-0".
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"round\",\"values\":[-0.4]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("0", result.output);
+}
+
 test "calculator missing operation" {
     var ct = CalculatorTool{};
     const t = ct.tool();
@@ -636,6 +684,18 @@ test "calculator invalid values return failed tool result" {
     try std.testing.expectEqualStrings("InvalidNumber", result.output);
 }
 
+test "calculator rejects integers beyond exact float precision" {
+    // Regression: large JSON integers used to be rounded silently when converted to f64.
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"add\",\"values\":[9007199254740993,1]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("IntegerPrecisionLoss", result.output);
+}
+
 test "calculator median handles values beyond 1024 items" {
     // Regression: median used to sort only the first 1024 values and ignore later entries.
     const values = try std.testing.allocator.alloc(f64, 1026);
@@ -662,11 +722,30 @@ test "calculator percentile handles values beyond 1024 items" {
     try std.testing.expectEqual(@as(f64, 1024.0), CalculatorTool.percentile(values, 100.0));
 }
 
-test "calculator formats large finite results without zero fallback" {
-    // Regression: large finite outputs used to overflow a fixed buffer and become the literal string "0".
+test "calculator formats large finite results with scientific notation" {
+    // Regression: large finite outputs used to allocate huge fixed-point strings and could degrade into "0".
     const result = try CalculatorTool.formatResult(std.testing.allocator, std.math.pow(f64, 10.0, 100.0));
     defer std.testing.allocator.free(result);
 
-    try std.testing.expect(result.len > 64);
-    try std.testing.expect(!std.mem.eql(u8, result, "0"));
+    try std.testing.expectEqualStrings("1e100", result);
+}
+
+test "calculator preserves tiny non-zero results" {
+    // Regression: tiny finite outputs used to round down to the literal string "0".
+    const result = try CalculatorTool.formatResult(std.testing.allocator, 0.0000004);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqualStrings("4e-7", result);
+}
+
+test "calculator rejects non-finite results" {
+    // Regression: overflow paths used to surface "inf" instead of a failed tool result.
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"exp\",\"values\":[1000]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("ResultNotFinite", result.output);
 }
