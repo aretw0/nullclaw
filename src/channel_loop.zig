@@ -895,6 +895,7 @@ fn processTelegramMessage(
     const conversation_context = buildConversationContext(.{
         .channel = "telegram",
         .account_id = tg_ptr.account_id,
+        .delivery_chat_id = sender,
         .peer_id = sender,
         .is_group = is_group,
         .group_id = if (is_group) sender else null,
@@ -1742,6 +1743,7 @@ pub fn runSignalLoop(
                 .account_id = sg_ptr.account_id,
                 .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
                 .sender_uuid = msg.sender_uuid,
+                .delivery_chat_id = msg.reply_target orelse msg.sender,
                 .peer_id = if (msg.is_group) msg.group_id else msg.sender,
                 .group_id = msg.group_id,
                 .is_group = msg.is_group,
@@ -1979,6 +1981,7 @@ pub fn runMatrixLoop(
             const conversation_context = buildConversationContext(.{
                 .channel = "matrix",
                 .account_id = mx_ptr.account_id,
+                .delivery_chat_id = typing_target,
                 .peer_id = if (msg.is_group) room_peer_id else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) room_peer_id else null,
@@ -2123,6 +2126,7 @@ pub fn runMaxLoop(
             const conversation_context = buildConversationContext(.{
                 .channel = "max",
                 .account_id = mx_ptr.account_id,
+                .delivery_chat_id = reply_target,
                 .peer_id = if (msg.is_group) reply_target else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) reply_target else null,

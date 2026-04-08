@@ -632,6 +632,15 @@ fn buildInboundConversationContext(
     msg: *const bus_mod.InboundMessage,
     meta: channel_adapters.InboundMetadata,
 ) ?ConversationContext {
+    const derived_peer = if (msg.channel.len > 0)
+        channel_adapters.derivePeerForStaticChannel(.{
+            .channel_name = msg.channel,
+            .sender_id = msg.sender_id,
+            .chat_id = msg.chat_id,
+        }, meta)
+    else
+        null;
+
     const inferred_is_group = if (meta.is_group) |value|
         value
     else if (meta.is_dm) |value|
@@ -660,7 +669,8 @@ fn buildInboundConversationContext(
         .sender_id = if (msg.sender_id.len > 0) msg.sender_id else null,
         .sender_username = meta.sender_username,
         .sender_display_name = meta.sender_display_name,
-        .peer_id = meta.peer_id orelse if (has_scope) msg.chat_id else null,
+        .delivery_chat_id = if (msg.chat_id.len > 0) msg.chat_id else null,
+        .peer_id = meta.peer_id orelse if (derived_peer) |peer| peer.id else if (has_scope) msg.chat_id else null,
         .group_id = group_id,
         .is_group = inferred_is_group,
     });
@@ -2403,11 +2413,52 @@ test "buildInboundConversationContext preserves discord identity metadata" {
     try std.testing.expectEqualStrings("discord", context.channel.?);
     try std.testing.expectEqualStrings("discord-main", context.account_id.?);
     try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expectEqualStrings("778899", context.delivery_chat_id.?);
     try std.testing.expectEqualStrings("778899", context.peer_id.?);
     try std.testing.expectEqualStrings("discord-user", context.sender_username.?);
     try std.testing.expectEqualStrings("Discord User", context.sender_display_name.?);
     try std.testing.expectEqualStrings("guild-1", context.group_id.?);
     try std.testing.expect(context.is_group.?);
+}
+
+test "buildInboundConversationContext keeps discord DM routing peer separate from delivery target" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "discord",
+        .sender_id = "user-42",
+        .chat_id = "dm-778899",
+        .content = "hello",
+        .session_key = "discord:discord-main:direct:user-42",
+    };
+    const context = buildInboundConversationContext(&msg, .{
+        .account_id = "discord-main",
+        .is_dm = true,
+    }) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("discord", context.channel.?);
+    try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expectEqualStrings("dm-778899", context.delivery_chat_id.?);
+    // Regression: Discord DM sessions are keyed by sender ID, not the DM channel ID.
+    try std.testing.expectEqualStrings("user-42", context.peer_id.?);
+    try std.testing.expect(!context.is_group.?);
+    try std.testing.expect(context.group_id == null);
+}
+
+test "buildInboundConversationContext keeps web direct sessions keyed by session id" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "web",
+        .sender_id = "user-42",
+        .chat_id = "session-99",
+        .content = "hello",
+        .session_key = "web:local:direct:session-99",
+    };
+    const context = buildInboundConversationContext(&msg, .{
+        .account_id = "local",
+        .is_dm = true,
+    }) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("session-99", context.delivery_chat_id.?);
+    try std.testing.expectEqualStrings("session-99", context.peer_id.?);
+    try std.testing.expect(!context.is_group.?);
 }
 
 test "buildInboundConversationContext keeps channel and sender when metadata is absent" {
@@ -2422,6 +2473,7 @@ test "buildInboundConversationContext keeps channel and sender when metadata is 
 
     try std.testing.expectEqualStrings("external", context.channel.?);
     try std.testing.expectEqualStrings("user-1", context.sender_id.?);
+    try std.testing.expectEqualStrings("chat-1", context.delivery_chat_id.?);
     try std.testing.expect(context.group_id == null);
     try std.testing.expect(context.is_group == null);
 }
@@ -2442,6 +2494,7 @@ test "buildInboundConversationContext uses standardized peer metadata for extern
 
     try std.testing.expectEqualStrings("external", context.channel.?);
     try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expectEqualStrings("120363-room", context.delivery_chat_id.?);
     try std.testing.expectEqualStrings("120363-room", context.peer_id.?);
     try std.testing.expectEqualStrings("120363-room", context.group_id.?);
     try std.testing.expect(context.is_group.?);

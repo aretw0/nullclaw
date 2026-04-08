@@ -27,6 +27,8 @@ const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
 const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
+const cron_mod = @import("cron.zig");
+const cron_add_mod = @import("tools/cron_add.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const streaming = @import("streaming.zig");
@@ -1086,7 +1088,10 @@ pub const SessionManager = struct {
         conversation_context: ?ConversationContext,
     ) void {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse parseChannelFromSessionKey(session_key)) else parseChannelFromSessionKey(session_key);
-        const chat_id = parsePeerIdFromSessionKey(session_key);
+        const chat_id = if (conversation_context) |ctx|
+            ctx.delivery_chat_id orelse parsePeerIdFromSessionKey(session_key)
+        else
+            parsePeerIdFromSessionKey(session_key);
         const account_id = if (conversation_context) |ctx| ctx.account_id else null;
         const peer_kind = if (conversation_context) |ctx|
             if (ctx.is_group) |is_group|
@@ -3552,6 +3557,48 @@ test "processMessage refreshes system prompt when conversation context is cleare
     const sys2 = session.agent.history.items[0].content;
     try testing.expect(std.mem.indexOf(u8, sys2, "## Conversation Context") == null);
     try testing.expect(std.mem.indexOf(u8, sys2, sender_uuid) == null);
+}
+
+test "setTurnToolContext prefers delivery chat target over direct peer session id" {
+    var schedule_tool = tools_mod.schedule.ScheduleTool{};
+    const tools = [_]Tool{schedule_tool.tool()};
+
+    const conversation_context: ?ConversationContext = .{
+        .channel = "discord",
+        .account_id = "discord-main",
+        .delivery_chat_id = "dm-channel-42",
+        .peer_id = "user-42",
+        .is_group = false,
+    };
+
+    // Regression: Discord DM sessions are keyed by author ID, but scheduled
+    // delivery must target the DM channel ID for outbound sends.
+    SessionManager.setTurnToolContext(&tools, "agent:main:discord:direct:user-42", conversation_context);
+    defer schedule_tool.setContext(null, null, null, null, null, null);
+
+    const parsed = try tools_mod.parseTestArgs("{\"action\":\"once\",\"delay\":\"1m\",\"prompt\":\"ping\"}");
+    defer parsed.deinit();
+
+    const result = try schedule_tool.execute(testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) testing.allocator.free(result.output);
+    try testing.expect(result.success);
+
+    var scheduler = cron_add_mod.loadScheduler(testing.allocator) catch return error.TestUnexpectedResult;
+    defer scheduler.deinit();
+    defer {
+        for (scheduler.listJobs()) |job| {
+            _ = scheduler.removeJob(job.id);
+        }
+        cron_mod.saveJobs(&scheduler) catch {};
+    }
+
+    const jobs = scheduler.listJobs();
+    try testing.expect(jobs.len > 0);
+    const job = jobs[jobs.len - 1];
+    try testing.expect(job.delivery.to != null);
+    try testing.expectEqualStrings("dm-channel-42", job.delivery.to.?);
+    try testing.expect(job.delivery.peer_id != null);
+    try testing.expectEqualStrings("user-42", job.delivery.peer_id.?);
 }
 
 test "processMessage updates last_active" {

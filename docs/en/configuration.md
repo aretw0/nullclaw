@@ -437,9 +437,9 @@ contract, see [External Channel Plugins](./external-channels.md).
 - `config` must be a JSON object; it is forwarded to the plugin `start` request as `params.config`.
 - Plugins must answer `get_manifest`, handle `start`/`send`/`stop`; `health` is recommended so supervision can detect disconnected sidecars instead of only live processes.
 - `get_manifest.result` must contain `protocol_version: 2`; `capabilities.health`, `capabilities.streaming`, `capabilities.send_rich`, `capabilities.typing`, `capabilities.edit`, `capabilities.delete`, `capabilities.reactions`, and `capabilities.read_receipts` are optional capability bits.
-- `health.result` must report an explicit boolean (`healthy`) or explicit health signals (`ok`, `connected`, `logged_in`); an empty object is treated as invalid.
+- `health.result` must report an explicit boolean (`healthy`) or explicit health signals (`ok`, `connected`, `logged_in`); an empty object is treated as invalid. For QR/device-link style channels, this is the place to report `connected: false` or `logged_in: false` while background auth is still in progress.
 - `start.params` now has a nested `runtime` object with `name`, `account_id`, and host-owned `state_dir`.
-- `start.result` must contain `started: true`; `send`, `send_rich`, `edit_message`, `delete_message`, and typing/message-action RPCs must return `result.accepted: true` when the plugin actually accepts the action. A JSON-RPC success envelope by itself is not enough.
+- `start.result` must contain `started: true`; `start` should return promptly after local initialization instead of blocking on QR scans or human login. `send`, `send_rich`, `edit_message`, `delete_message`, and typing/message-action RPCs must return `result.accepted: true` when the plugin actually accepts the action. A JSON-RPC success envelope by itself is not enough.
 - `send.params` now has nested `runtime` and `message` objects; text payloads use `message.text`.
 - If a plugin declares both `capabilities.edit=true` and `capabilities.delete=true`, `send.result` may also include `message_id` or `message { target?, message_id }`; that lets nullclaw keep a tracked draft updated on channels that do not support native `.chunk` streaming.
 - If `capabilities.streaming=true`, nullclaw may emit `.chunk` staged `send` events during model streaming. If it is absent or `false`, nullclaw will only emit final responses.
@@ -470,6 +470,35 @@ Telegram example:
   }
 }
 ```
+
+WeChat example:
+
+```json
+{
+  "channels": {
+    "wechat": [
+      {
+        "account_id": "main",
+        "callback_token": "wechat-callback-token",
+        "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        "app_id": "wx1234567890abcdef",
+        "app_secret": "wechat-app-secret",
+        "allow_from": ["openid_123"]
+      }
+    ]
+  }
+}
+```
+
+WeChat notes:
+
+- NullClaw already supports WeChat as a built-in webhook channel; you do not need an external plugin to receive Official Account callbacks.
+- The gateway webhook path is `/wechat`. Use `?account_id=<id>` when you have multiple configured WeChat accounts.
+- `callback_token` is required for signature verification.
+- `encoding_aes_key` is optional but required when your WeChat callback is configured for `encrypt_type=aes`.
+- `app_id` and `app_secret` are optional unless you want outbound active-message delivery through the WeChat custom message API.
+- `allow_from` should list trusted OpenIDs. Keep it explicit; do not rely on an empty allowlist for privacy.
+- Build with `-Dchannels=wechat` (or `-Dchannels=all`) if your binary was compiled without the WeChat channel.
 
 Telegram forum topics:
 
@@ -650,8 +679,8 @@ Effect on delivery:
 
 Rules:
 
-- `allow_from: []` means deny all inbound messages.
-- `allow_from: ["*"]` means allow all sources (use only when you accept the risk).
+- Empty `allow_from` behavior is channel-specific. Some channels, including WeChat and Discord, treat an omitted or empty list as "no filtering" rather than "deny all", so set explicit IDs/OpenIDs for a private bot.
+- `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
 
 Max example:
 

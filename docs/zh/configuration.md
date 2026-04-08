@@ -377,9 +377,9 @@ nullclaw onboard --interactive
 - `config` 必须是 JSON object；它会原样透传给插件 `start` 请求里的 `params.config`。
 - 插件必须响应 `get_manifest`，处理 `start`、`send`、`stop`；建议实现 `health`，这样 supervision 才能识别“进程活着但 sidecar 已断开”的状态。
 - `get_manifest.result` 现在必须显式声明 `protocol_version: 2`；`capabilities.health`、`capabilities.streaming`、`capabilities.send_rich`、`capabilities.typing`、`capabilities.edit`、`capabilities.delete`、`capabilities.reactions`、`capabilities.read_receipts` 都是可选能力标记。
-- `health.result` 必须返回显式布尔值（`healthy`）或显式健康信号（`ok`、`connected`、`logged_in`）；空对象会被视为无效响应。
+- `health.result` 必须返回显式布尔值（`healthy`）或显式健康信号（`ok`、`connected`、`logged_in`）；空对象会被视为无效响应。对于需要扫码或设备绑定的渠道，后台认证尚未完成时，应在这里报告 `connected: false` 或 `logged_in: false`。
 - `start.params` 现在包含嵌套的 `runtime` 对象，里面有 `name`、`account_id` 和 host 提供的 `state_dir`。
-- `start.result` 必须返回 `started: true`；`send`、`send_rich`、`edit_message`、`delete_message` 以及其他 typing/message-action RPC 在真正接受动作时都必须返回 `result.accepted: true`。仅仅没有 JSON-RPC `error` 已经不够了。
+- `start.result` 必须返回 `started: true`；`start` 应在完成本地初始化后尽快返回，而不是阻塞等待扫码或人工登录。`send`、`send_rich`、`edit_message`、`delete_message` 以及其他 typing/message-action RPC 在真正接受动作时都必须返回 `result.accepted: true`。仅仅没有 JSON-RPC `error` 已经不够了。
 - `send.params` 现在也拆成嵌套的 `runtime` 和 `message` 对象；文本字段统一使用 `message.text`。
 - 如果插件同时声明了 `capabilities.edit=true` 和 `capabilities.delete=true`，那么 `send.result` 还可以返回 `message_id`，或者返回 `message { target?, message_id }`；这样 nullclaw 就能在不支持原生 `.chunk` 流式发送的渠道上维护一条可编辑的草稿消息。
 - 如果 `capabilities.streaming=true`，nullclaw 可能在模型流式输出时发送 `.chunk` 阶段的 `send` 事件；如果缺省或为 `false`，只会发送最终结果。
@@ -411,10 +411,39 @@ Telegram 示例：
 }
 ```
 
+WeChat 示例：
+
+```json
+{
+  "channels": {
+    "wechat": [
+      {
+        "account_id": "main",
+        "callback_token": "wechat-callback-token",
+        "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        "app_id": "wx1234567890abcdef",
+        "app_secret": "wechat-app-secret",
+        "allow_from": ["openid_123"]
+      }
+    ]
+  }
+}
+```
+
+WeChat 说明：
+
+- NullClaw 已经内置 WeChat webhook channel；接收公众号回调时不需要额外的 external plugin。
+- Gateway webhook 路径是 `/wechat`。配置多个 WeChat 账号时，可通过 `?account_id=<id>` 选择账号。
+- `callback_token` 是签名校验必填项。
+- `encoding_aes_key` 是可选项；当 WeChat 回调配置为 `encrypt_type=aes` 时必须提供。
+- `app_id` 和 `app_secret` 只有在需要通过 WeChat custom message API 主动发送消息时才需要。
+- `allow_from` 应显式列出可信 OpenID，不要依赖空 allowlist 来实现隐私隔离。
+- 如果当前二进制未编译 WeChat channel，请使用 `-Dchannels=wechat`（或 `-Dchannels=all`）重新构建。
+
 规则说明：
 
-- `allow_from: []` 表示拒绝所有入站消息。
-- `allow_from: ["*"]` 表示允许所有来源（仅在你明确接受风险时使用）。
+- 空 `allow_from` 的行为因渠道而异。有些渠道（例如 WeChat 和 Discord）会把省略或留空视为“关闭过滤”，而不是“拒绝所有”；如果要做私有机器人，请显式填写 ID/OpenID。
+- `allow_from: ["*"]` 会在基于 allowlist 的渠道上允许所有来源，仅在你明确接受风险时使用。
 
 Telegram forum topics：
 

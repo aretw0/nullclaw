@@ -82,12 +82,14 @@ fn simpleConversationContext(
     channel: []const u8,
     account_id: ?[]const u8,
     peer_id: []const u8,
+    delivery_chat_id: ?[]const u8,
     is_group: bool,
     group_id: ?[]const u8,
 ) ?ConversationContext {
     return buildConversationContext(.{
         .channel = channel,
         .account_id = account_id,
+        .delivery_chat_id = delivery_chat_id,
         .peer_id = peer_id,
         .is_group = is_group,
         .group_id = if (is_group) (group_id orelse peer_id) else null,
@@ -1728,6 +1730,7 @@ fn webhookRouting(
             .sender_id = sender_id,
             .sender_username = sender_username,
             .sender_display_name = sender_display_name,
+            .delivery_chat_id = bus_chat_id,
             .peer_id = peer_id,
             .is_group = if (peer_kind) |kind| kind != .direct else null,
             .group_id = if (peer_kind) |kind| if (kind == .direct) null else peer_id else null,
@@ -3048,6 +3051,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     "telegram",
                     tg_account_id,
                     cid_str,
+                    chat_target,
                     std.mem.eql(u8, peer_kind, "group"),
                     if (std.mem.eql(u8, peer_kind, "group")) cid_str else null,
                 );
@@ -3194,6 +3198,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     "whatsapp",
                     wa_account_id,
                     wa_peer_id,
+                    wa_chat_target,
                     wa_is_group,
                     wa_group_id,
                 );
@@ -3257,6 +3262,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     "whatsapp",
                     wa_account_id,
                     wa_peer_id,
+                    wa_chat_target_ns,
                     wa_is_group,
                     wa_group_id,
                 );
@@ -3467,6 +3473,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                         "slack",
                         slack_cfg.account_id,
                         if (interactive_target.is_dm) sender_id_val.string else interactive_target.channel_id,
+                        selection.target,
                         !interactive_target.is_dm,
                         if (!interactive_target.is_dm) interactive_target.channel_id else null,
                     );
@@ -3608,6 +3615,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             "slack",
             slack_cfg.account_id,
             if (is_dm) sender_id else channel_id,
+            channel_id,
             !is_dm,
             if (!is_dm) channel_id else null,
         );
@@ -3744,6 +3752,7 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                         "line",
                         line_account_id,
                         line_peer.id,
+                        line_target,
                         !std.mem.eql(u8, line_peer.kind, "direct"),
                         if (!std.mem.eql(u8, line_peer.kind, "direct")) line_peer.id else null,
                     );
@@ -3871,6 +3880,7 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
             const conversation_context: ?ConversationContext = simpleConversationContext(
                 "lark",
                 lark_account_id,
+                msg.sender,
                 msg.sender,
                 msg.is_group,
                 if (msg.is_group) msg.sender else null,
@@ -4410,6 +4420,7 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
                 .channel = "qq",
                 .account_id = account_id,
                 .sender_id = inbound.sender_id,
+                .delivery_chat_id = inbound.chat_id,
                 .peer_id = if (peer) |resolved| resolved.id else null,
                 .is_group = if (peer) |resolved| resolved.kind != .direct else null,
                 .group_id = if (peer) |resolved| if (resolved.kind == .direct) null else resolved.id else null,
@@ -4527,6 +4538,7 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
                 "max",
                 max_cfg.account_id,
                 peer_id,
+                reply_target,
                 inbound.is_group,
                 if (inbound.is_group) reply_target else null,
             );
@@ -4711,6 +4723,7 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         .account_id = teams_cfg.account_id,
         .sender_uuid = from_id,
         .sender_name = from_name,
+        .delivery_chat_id = chat_id,
         .peer_id = peer_info.peer.id,
         .is_group = !peer_info.is_dm,
         .group_id = if (peer_info.is_dm) null else peer_info.peer.id,
@@ -7736,7 +7749,26 @@ test "webhookRouting uses route engine when standardized peer metadata is presen
     try std.testing.expect(std.mem.indexOf(u8, routing.metadata_json.?, "\"peer_id\":\"session-1\"") != null);
     try std.testing.expect(routing.conversation_context != null);
     try std.testing.expectEqualStrings("web", routing.conversation_context.?.channel.?);
+    try std.testing.expectEqualStrings("session-1", routing.conversation_context.?.delivery_chat_id.?);
     try std.testing.expectEqualStrings("session-1", routing.conversation_context.?.peer_id.?);
+}
+
+test "simpleConversationContext keeps delivery target separate from routing peer" {
+    const context = simpleConversationContext(
+        "slack",
+        "slack-main",
+        "user-42",
+        "D123456",
+        false,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("slack", context.channel.?);
+    try std.testing.expectEqualStrings("slack-main", context.account_id.?);
+    try std.testing.expectEqualStrings("D123456", context.delivery_chat_id.?);
+    try std.testing.expectEqualStrings("user-42", context.peer_id.?);
+    try std.testing.expect(!context.is_group.?);
+    try std.testing.expect(context.group_id == null);
 }
 
 // ── extractBody tests ────────────────────────────────────────────
