@@ -550,7 +550,7 @@ pub const OpenAiCompatibleProvider = struct {
             }
         }
 
-        try appendExtraParams(&buf, allocator, request.session_id, extra_body_params);
+        try root.appendOpenAiBodyExtraParams(&buf, allocator, request.session_id, extra_body_params);
         try buf.appendSlice(allocator, ",\"stream\":false}");
         return try buf.toOwnedSlice(allocator);
     }
@@ -872,7 +872,7 @@ pub const OpenAiCompatibleProvider = struct {
 
         try buf.append(allocator, ']');
         try root.appendGenerationFields(&buf, allocator, model, temperature, null, null);
-        try appendExtraParams(&buf, allocator, null, extra_body_params);
+        try root.appendOpenAiBodyExtraParams(&buf, allocator, null, extra_body_params);
         try buf.appendSlice(allocator, ",\"stream\":false}");
 
         return try buf.toOwnedSlice(allocator);
@@ -1684,33 +1684,6 @@ fn serializeMessagesInto(
     }
 }
 
-/// Appends the "user" field (from session_id) and any configured extra_body_params
-/// into the request JSON buffer.
-fn appendExtraParams(
-    buf: *std.ArrayListUnmanaged(u8),
-    allocator: std.mem.Allocator,
-    session_id: ?[]const u8,
-    extra_body_params: ?[]const u8,
-) !void {
-    if (session_id) |sid| {
-        try buf.appendSlice(allocator, ",\"user\":");
-        try root.appendJsonString(buf, allocator, sid);
-    }
-
-    if (extra_body_params) |extra| {
-        // extra is expected to be a compact JSON object like {"key":"val","other":123}
-        // We strip the outer braces and append the contents.
-        const trimmed = std.mem.trim(u8, extra, " \t\r\n");
-        if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
-            const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
-            if (inner.len > 0) {
-                try buf.append(allocator, ',');
-                try buf.appendSlice(allocator, inner);
-            }
-        }
-    }
-}
-
 /// Build a full chat request JSON body from a ChatRequest (OpenAI-compatible format).
 fn buildChatRequestBody(
     allocator: std.mem.Allocator,
@@ -1765,7 +1738,7 @@ fn buildChatRequestBody(
         }
     }
 
-    try appendExtraParams(&buf, allocator, session_id, extra_body_params);
+    try root.appendOpenAiBodyExtraParams(&buf, allocator, session_id, extra_body_params);
     try buf.appendSlice(allocator, ",\"stream\":false}");
 
     return try buf.toOwnedSlice(allocator);
@@ -1825,7 +1798,7 @@ fn buildStreamingChatRequestBody(
         }
     }
 
-    try appendExtraParams(&buf, allocator, session_id, extra_body_params);
+    try root.appendOpenAiBodyExtraParams(&buf, allocator, session_id, extra_body_params);
     try buf.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
 
     return try buf.toOwnedSlice(allocator);

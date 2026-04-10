@@ -68,6 +68,7 @@ pub const SplitThinkContent = helpers.SplitThinkContent;
 pub const splitThinkContent = helpers.splitThinkContent;
 pub const stripThinkBlocks = helpers.stripThinkBlocks;
 pub const normalizeOpenAiReasoningEffort = helpers.normalizeOpenAiReasoningEffort;
+pub const appendOpenAiBodyExtraParams = helpers.appendOpenAiBodyExtraParams;
 
 // Direct re-exports from utility modules
 pub const appendJsonString = json_util.appendJsonString;

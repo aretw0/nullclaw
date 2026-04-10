@@ -418,7 +418,7 @@ pub const ProviderHolder = union(enum) {
                 prov.native_tools = native_tools;
                 break :blk .{ .ollama = prov };
             },
-            .openrouter_provider => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
+            .openrouter_provider => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, extra_body_params) },
             .compatible_provider => blk: {
                 // Config base_url overrides built-in URL table and custom: prefix
                 const url = base_url orelse
@@ -467,15 +467,15 @@ pub const ProviderHolder = union(enum) {
             .claude_cli_provider => if (claude_cli.ClaudeCliProvider.init(allocator, null)) |p|
                 .{ .claude_cli = p }
             else |_|
-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
+                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
             .codex_cli_provider => if (codex_cli.CodexCliProvider.init(allocator, null)) |p|
                 .{ .codex_cli = p }
             else |_|
-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
+                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
             .gemini_cli_provider => if (gemini_cli.GeminiCliProvider.init(allocator, null)) |p|
                 .{ .gemini_cli = p }
             else |_|
-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
+                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
             .openai_codex_provider => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, null) },
             // Unknown provider: if base_url is configured, treat as OpenAI-compatible;
             // otherwise fall back to OpenRouter.
@@ -497,7 +497,7 @@ pub const ProviderHolder = union(enum) {
                 if (chat_template_enable_thinking_param) prov.chat_template_enable_thinking_param = true;
                 prov.extra_body_params = extra_body_params;
                 break :blk .{ .compatible = prov };
-            } else .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
+            } else .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
         };
     }
 };
@@ -961,6 +961,14 @@ test "fromConfig threads extra_body_params to openai provider" {
     defer h.deinit();
     try std.testing.expect(h == .openai);
     try std.testing.expectEqualStrings("{\"seed\":11}", h.openai.extra_body_params.?);
+}
+
+test "fromConfig threads extra_body_params to openrouter provider" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "openrouter", "sk-or-test", null, true, null, null, false, "{\"seed\":13}");
+    defer h.deinit();
+    try std.testing.expect(h == .openrouter);
+    try std.testing.expectEqualStrings("{\"seed\":13}", h.openrouter.extra_body_params.?);
 }
 
 test "detectProviderByApiKey openrouter" {
