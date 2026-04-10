@@ -10,6 +10,8 @@ const config_types = @import("../config_types.zig");
 const config_module = @import("../config.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
+const interaction_choices = @import("../interactions/choices.zig");
+const onboard = @import("../onboard.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const control_plane = @import("../control_plane.zig");
@@ -25,6 +27,8 @@ const isSlashName = control_plane.isSlashName;
 
 pub const BARE_SESSION_RESET_PROMPT =
     "A new session was started via /new or /reset. Execute your Session Startup sequence now - read the required files before responding to the user. Then greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
+
+const MODEL_MENU_PAGE_SIZE: usize = 10;
 
 pub fn bareSessionResetPrompt(message: []const u8) ?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
@@ -200,6 +204,190 @@ fn parsePositiveUsize(raw: []const u8) ?usize {
     const n = std.fmt.parseInt(usize, raw, 10) catch return null;
     if (n == 0) return null;
     return n;
+}
+
+fn interactiveModelMenuChannel(session_id: ?[]const u8) ?[]const u8 {
+    const sid = session_id orelse return null;
+
+    if (std.mem.startsWith(u8, sid, "agent:")) {
+        const after_agent = sid["agent:".len..];
+        const agent_sep = std.mem.indexOfScalar(u8, after_agent, ':') orelse return null;
+        const routed = after_agent[agent_sep + 1 ..];
+        if (std.mem.startsWith(u8, routed, "telegram:")) return "telegram";
+    }
+
+    if (std.mem.startsWith(u8, sid, "telegram:")) return "telegram";
+    return null;
+}
+
+fn modelMenuChoiceLabel(allocator: std.mem.Allocator, model_id: []const u8, is_current: bool) ![]u8 {
+    const prefix = if (is_current) "* " else "";
+    const max_model_len = interaction_choices.MAX_LABEL_LEN - prefix.len;
+    const visible_model = if (model_id.len <= max_model_len) model_id else model_id[0..max_model_len];
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, visible_model });
+}
+
+fn freeOwnedStringSlice(allocator: std.mem.Allocator, items: [][]const u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
+}
+
+fn renderInteractiveModelMenuFromModels(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    current_model: []const u8,
+    page_number: usize,
+    models: []const []const u8,
+) !?[]u8 {
+    if (models.len == 0) return null;
+
+    const total_pages = @max(@as(usize, 1), std.math.divCeil(usize, models.len, MODEL_MENU_PAGE_SIZE) catch 1);
+    const clamped_page = @min(@max(page_number, 1), total_pages);
+    const start = (clamped_page - 1) * MODEL_MENU_PAGE_SIZE;
+    const end = @min(start + MODEL_MENU_PAGE_SIZE, models.len);
+
+    const ChoiceDraft = struct {
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    };
+
+    var options: [interaction_choices.MAX_OPTIONS]ChoiceDraft = undefined;
+    var option_id_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_ID_LEN]u8 = undefined;
+    var submit_text_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_SUBMIT_TEXT_LEN]u8 = undefined;
+    var option_count: usize = 0;
+    var labels_to_free: [interaction_choices.MAX_OPTIONS]?[]u8 = .{null} ** interaction_choices.MAX_OPTIONS;
+    defer {
+        for (labels_to_free) |label_opt| {
+            if (label_opt) |label| allocator.free(label);
+        }
+    }
+
+    for (models[start..end], 0..) |model_id, idx| {
+        const label = try modelMenuChoiceLabel(allocator, model_id, std.mem.eql(u8, model_id, current_model));
+        labels_to_free[option_count] = label;
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model {s}", .{model_id});
+        const option_id = try std.fmt.bufPrint(&option_id_bufs[option_count], "m{d}", .{idx + 1});
+
+        options[option_count] = .{
+            .id = option_id,
+            .label = label,
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (clamped_page > 1) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page - 1});
+        options[option_count] = .{
+            .id = "prev",
+            .label = "Prev",
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+    if (clamped_page < total_pages) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page + 1});
+        options[option_count] = .{
+            .id = "next",
+            .label = "Next",
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (option_count < interaction_choices.MIN_OPTIONS) return null;
+
+    const visible = try std.fmt.allocPrint(
+        allocator,
+        "Current model: {s}\nProvider: {s}\nChoose a model (page {d}/{d}).",
+        .{ current_model, provider, clamped_page, total_pages },
+    );
+    defer allocator.free(visible);
+
+    return try interaction_choices.renderAssistantChoices(allocator, visible, options[0..option_count]);
+}
+
+fn renderInteractiveModelMenu(self: anytype, page_number: usize) !?[]u8 {
+    if (interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null) == null) {
+        return null;
+    }
+    if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
+    if (!@hasField(@TypeOf(self.*), "model_name")) return null;
+
+    var cfg_opt: ?config_module.Config = if (builtin.is_test) null else config_module.Config.load(self.allocator) catch null;
+    defer if (cfg_opt) |*cfg| cfg.deinit();
+
+    const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(self.default_provider) else null;
+    const models = onboard.fetchModels(self.allocator, self.default_provider, api_key) catch return null;
+    defer freeOwnedStringSlice(self.allocator, models);
+
+    return renderInteractiveModelMenuFromModels(
+        self.allocator,
+        self.default_provider,
+        self.model_name,
+        page_number,
+        models,
+    );
+}
+
+test "interactiveModelMenuChannel only enables telegram" {
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:chat-1").?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:main:chat-1").?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("agent:main:telegram:group:42").?);
+    try std.testing.expect(interactiveModelMenuChannel("discord:dm-1") == null);
+    try std.testing.expect(interactiveModelMenuChannel("agent:main:discord:direct:42") == null);
+    try std.testing.expect(interactiveModelMenuChannel("cli") == null);
+    try std.testing.expect(interactiveModelMenuChannel(null) == null);
+}
+
+test "renderInteractiveModelMenuFromModels builds first page with next button" {
+    const allocator = std.testing.allocator;
+    const models = [_][]const u8{
+        "alpha",
+        "beta",
+        "gamma",
+        "theta",
+        "zeta",
+        "eta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+    };
+
+    const rendered = (try renderInteractiveModelMenuFromModels(allocator, "anthropic", "beta", 1, &models)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, interaction_choices.START_TAG) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "page 1/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"label\":\"* beta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model page 2\"") != null);
+}
+
+test "renderInteractiveModelMenuFromModels builds later page with prev button" {
+    const allocator = std.testing.allocator;
+    const models = [_][]const u8{
+        "alpha",
+        "beta",
+        "gamma",
+        "theta",
+        "zeta",
+        "eta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+    };
+
+    const rendered = (try renderInteractiveModelMenuFromModels(allocator, "anthropic", "nu", 2, &models)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "page 2/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model page 1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model nu\"") != null);
 }
 
 fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
@@ -3727,7 +3915,12 @@ pub fn composeFinalReply(
 
     if (show_reasoning) {
         try w.writeAll("Reasoning:\n");
-        try w.writeAll(reasoning_content.?);
+        var lines = std.mem.splitScalar(u8, reasoning_content.?, '\n');
+        while (lines.next()) |line| {
+            try w.writeAll("> ");
+            try w.writeAll(line);
+            try w.writeAll("\n");
+        }
         try w.writeAll("\n\n");
     }
     try w.writeAll(base_text);
@@ -3789,10 +3982,22 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .status => return try formatStatus(self),
         .whoami => return try formatWhoAmI(self),
         .model => {
+            const first = firstToken(cmd.arg);
+            if (std.ascii.eqlIgnoreCase(first, "page")) {
+                const page_raw = std.mem.trim(u8, splitFirstToken(cmd.arg).tail, " \t");
+                const page_number = parsePositiveUsize(page_raw) orelse 1;
+                if (try renderInteractiveModelMenu(self, page_number)) |menu| {
+                    return menu;
+                }
+                return try self.formatModelStatus();
+            }
             if (cmd.arg.len == 0 or
                 std.ascii.eqlIgnoreCase(cmd.arg, "list") or
                 std.ascii.eqlIgnoreCase(cmd.arg, "status"))
             {
+                if (try renderInteractiveModelMenu(self, 1)) |menu| {
+                    return menu;
+                }
                 return try self.formatModelStatus();
             }
             if (std.ascii.eqlIgnoreCase(cmd.arg, "auto")) {
