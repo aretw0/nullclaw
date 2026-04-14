@@ -65,6 +65,7 @@ const WORKSPACE_IDENTITY_TEMPLATE = @embedFile("workspace_templates/IDENTITY.md"
 const WORKSPACE_USER_TEMPLATE = @embedFile("workspace_templates/USER.md");
 const WORKSPACE_HEARTBEAT_TEMPLATE = @embedFile("workspace_templates/HEARTBEAT.md");
 const WORKSPACE_BOOTSTRAP_TEMPLATE = @embedFile("workspace_templates/BOOTSTRAP.md");
+const MODELS_REFRESH_MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 // ── Project context ──────────────────────────────────────────────
 
 pub const ProjectContext = struct {
@@ -2456,6 +2457,26 @@ const catalog_providers = [_]ModelsCatalogProvider{
     .{ .name = "openrouter", .url = "https://openrouter.ai/api/v1/models", .models_path = "data", .id_field = "id" },
 };
 
+const ModelsRefreshCurlCommand = struct {
+    argv: [5][]const u8,
+    max_output_bytes: usize = MODELS_REFRESH_MAX_OUTPUT_BYTES,
+};
+
+fn buildModelsRefreshCurlCommand(url: []const u8) ModelsRefreshCurlCommand {
+    return .{
+        .argv = .{ "curl", "-sf", "--max-time", "10", url },
+    };
+}
+
+fn runModelsRefreshCurl(allocator: std.mem.Allocator, url: []const u8) !std.process.Child.RunResult {
+    const command = buildModelsRefreshCurlCommand(url);
+    return std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &command.argv,
+        .max_output_bytes = command.max_output_bytes,
+    });
+}
+
 /// Refresh the model catalog by fetching available models from known providers.
 /// Saves results to models_cache.json in the config directory.
 pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
@@ -2498,10 +2519,7 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
         try out.flush();
 
         // Run curl to fetch models list
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{ "curl", "-sf", "--max-time", "10", cp.url },
-        }) catch {
+        const result = runModelsRefreshCurl(allocator, cp.url) catch {
             try out.print("  [SKIP] {s}: curl failed\n", .{cp.name});
             try out.flush();
             continue;
@@ -4296,6 +4314,14 @@ test "catalog_providers names are unique" {
             try std.testing.expect(!std.mem.eql(u8, cp1.name, cp2.name));
         }
     }
+}
+
+test "buildModelsRefreshCurlCommand sets output budget for large provider catalogs" {
+    const command = buildModelsRefreshCurlCommand("https://openrouter.ai/api/v1/models");
+    try std.testing.expectEqual(@as(usize, MODELS_REFRESH_MAX_OUTPUT_BYTES), command.max_output_bytes);
+    try std.testing.expect(command.max_output_bytes > 400_000);
+    try std.testing.expectEqualStrings("curl", command.argv[0]);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/models", command.argv[4]);
 }
 
 test "known_providers includes gemini-cli" {
