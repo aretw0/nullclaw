@@ -183,7 +183,7 @@ pub fn loadContextWithRuntime(
                     try w.writeAll("[Memory context]\n");
                     wrote_header = true;
                 }
-                const content = truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
+                const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
                 const sanitized = try sanitizeMemoryText(allocator, content);
                 defer allocator.free(sanitized);
                 try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });

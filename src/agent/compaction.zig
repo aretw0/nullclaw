@@ -254,7 +254,7 @@ fn buildCompactionTranscript(
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, ": ");
         // Truncate very long messages in transcript
-        const content = if (msg.content.len > 500) msg.content[0..500] else msg.content;
+        const content = if (msg.content.len > 500) util.truncateUtf8(msg.content, 500) else msg.content;
         try buf.appendSlice(allocator, content);
         try buf.append(allocator, '\n');
 
