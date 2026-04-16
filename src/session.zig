@@ -15,6 +15,7 @@ const Config = @import("config.zig").Config;
 const fs_compat = @import("fs_compat.zig");
 const agent_routing = @import("agent_routing.zig");
 const agent_mod = @import("agent/root.zig");
+const turn_persistence = @import("agent/turn_persistence.zig");
 const Agent = agent_mod.Agent;
 const NamedAgentConfig = @import("config_types.zig").NamedAgentConfig;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
@@ -84,13 +85,6 @@ fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
         total += agent_mod.estimate_text_tokens(entry.content);
     }
     return total;
-}
-
-fn persistedAssistantReply(agent: *const Agent, response: []const u8) []const u8 {
-    if (agent.history.items.len == 0) return response;
-    const last = agent.history.items[agent.history.items.len - 1];
-    if (last.role != .assistant) return response;
-    return last.content;
 }
 
 fn restorePersistedSessionState(session: *Session, entries: []const memory_mod.MessageEntry) void {
@@ -1677,8 +1671,6 @@ pub const SessionManager = struct {
             session.agent.stream_ctx = null;
         }
 
-        const turn_input = agent_mod.commands.planTurnInput(content);
-
         // Record agent start event with channel attribution
         const start_event = @import("observability.zig").ObserverEvent{ .agent_start = .{
             .provider = session.agent.provider.getName(),
@@ -1699,34 +1691,10 @@ pub const SessionManager = struct {
 
         // Persist messages via session store
         if (session.agent.session_store) |store| {
-            if (turn_input.clear_session) {
-                // Clear persisted messages on session reset
-                store.clearMessages(session_key) catch {};
-                // Clear stale auto-saved memories
-                store.clearAutoSaved(session_key) catch {};
-            }
-
-            if (agent_mod.commands.persistedRuntimeCommand(content)) |runtime_command| {
-                store.saveMessage(session_key, RUNTIME_COMMAND_ROLE, runtime_command) catch {};
-            }
-
-            if (turn_input.llm_user_message) |persisted_user| {
-                // Persist canonical conversation history.
-                // Local-only slash commands are skipped, but any input that
-                // reached the LLM must persist with the exact same routing
-                // decision used by Agent.turn().
-                // When the turn ends with an assistant history message, prefer
-                // that canonical text over the rendered reply so restored
-                // sessions do not replay /usage footers or reasoning blocks.
-                // Some degraded turns return a fallback response without
-                // appending a final assistant history entry; in that case we
-                // must persist the actual response instead of stale tool-step
-                // assistant text from earlier in the turn.
-                const persisted_assistant = persistedAssistantReply(&session.agent, response);
-                store.saveMessage(session_key, "user", persisted_user) catch {};
-                store.saveMessage(session_key, "assistant", persisted_assistant) catch {};
-                store.saveUsage(session_key, session.agent.total_tokens) catch {};
-            }
+            turn_persistence.persistTurn(store, .{
+                .history = session.agent.history.items,
+                .total_tokens = session.agent.total_tokens,
+            }, session_key, content, response);
         }
 
         if (self.config.diagnostics.log_message_payloads) {

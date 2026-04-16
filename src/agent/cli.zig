@@ -33,6 +33,7 @@ const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
 
 const Agent = @import("root.zig").Agent;
+const turn_persistence = @import("turn_persistence.zig");
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
@@ -59,6 +60,15 @@ const CliProviderContext = struct {
 
 fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
     return !supports_streaming or !emitted_text;
+}
+
+fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8) void {
+    const store = agent.session_store orelse return;
+    const session_key = agent.memory_session_id orelse return;
+    turn_persistence.persistTurn(store, .{
+        .history = agent.history.items,
+        .total_tokens = agent.total_tokens,
+    }, session_key, content, response);
 }
 
 fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
@@ -534,6 +544,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
+        persistCliTurn(&agent, message, response);
+
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("{s}\n", .{response});
         } else {
@@ -683,6 +695,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             continue;
         };
         defer allocator.free(response);
+
+        persistCliTurn(&agent, debounced_input.current, response);
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("\n{s}\n\n", .{response});
